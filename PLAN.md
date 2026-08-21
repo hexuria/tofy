@@ -91,5 +91,5 @@ No AWS, no new kinds, no PgPool.
 ## Later
 
 - Importers into the same IR (not a write path; not auto-loaded) — **Compose subset shipped:** `tofy import compose` emits JSON IR. `--spec` remains JSON-only. Unknown images fail.
-- More app-adjacent kinds
+- More app-adjacent kinds — **`mysql` shipped** (builders / Docker / Tofu docker / AWS RDS). Default examples stay postgres+redis+bucket so existing smokes are unchanged.
 - Optional live `PgPool` after apply for Rust apps that want it. Do not default to Shuttle. The consume path for other languages stays env

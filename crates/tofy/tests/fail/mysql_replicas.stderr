@@ -1,0 +1,5 @@
+error[E0599]: no method named `replicas` found for struct `tofy::builder::Mysql` in the current scope
+ --> tests/fail/mysql_replicas.rs:4:24
+  |
+4 |     let _ = mysql("x").replicas(2);
+  |                        ^^^^^^^^ method not found in `Mysql<Open>`

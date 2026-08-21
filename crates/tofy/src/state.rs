@@ -109,6 +109,7 @@ pub fn set_private(path: &Path) -> Result<()> {
 pub fn docker_image(r: &Resource) -> String {
     match r.kind {
         Kind::Postgres => format!("postgres:{}", r.version_or_default()),
+        Kind::Mysql => format!("mysql:{}", r.version_or_default()),
         Kind::Redis => format!("redis:{}", r.version_or_default()),
         Kind::Bucket => format!("minio/minio:{}", r.version_or_default()),
     }
@@ -116,7 +117,7 @@ pub fn docker_image(r: &Resource) -> String {
 
 fn aws_image(r: &Resource) -> String {
     match r.kind {
-        Kind::Postgres => r.size.aws_rds_instance_class().to_string(),
+        Kind::Postgres | Kind::Mysql => r.size.aws_rds_instance_class().to_string(),
         Kind::Redis => r.size.aws_elasticache_node_type().to_string(),
         Kind::Bucket => format!("s3:{}", r.size.aws_s3_storage_class()),
     }
@@ -222,6 +223,26 @@ fn local_outputs_for(
             out.insert("internal_host".into(), in_host.to_string());
             out.insert("internal_port".into(), internal_port.to_string());
         }
+        Kind::Mysql => {
+            let user = "tofy".to_string();
+            let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
+            let database = r.name.replace('-', "_");
+            out.insert(
+                "uri".into(),
+                format!("mysql://{user}:{password}@127.0.0.1:{port}/{database}"),
+            );
+            out.insert(
+                "internal_uri".into(),
+                format!("mysql://{user}:{password}@{in_host}:{internal_port}/{database}"),
+            );
+            out.insert("user".into(), user);
+            out.insert("password".into(), password);
+            out.insert("database".into(), database);
+            out.insert("host".into(), "127.0.0.1".into());
+            out.insert("port".into(), port.to_string());
+            out.insert("internal_host".into(), in_host.to_string());
+            out.insert("internal_port".into(), internal_port.to_string());
+        }
         Kind::Redis => {
             let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
             out.insert(
@@ -276,6 +297,23 @@ fn aws_outputs_for(
                 out.insert(
                     "uri".into(),
                     format!("postgres://{user}:{password}@{host}:{port}/{database}"),
+                );
+                out.insert("host".into(), host);
+            }
+            out.insert("user".into(), user);
+            out.insert("password".into(), password);
+            out.insert("database".into(), database);
+            out.insert("port".into(), port.to_string());
+        }
+        Kind::Mysql => {
+            let user = "tofy".to_string();
+            let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
+            let database = r.name.replace('-', "_");
+            let host = existing_output(have, "host").unwrap_or_default();
+            if !host.is_empty() {
+                out.insert(
+                    "uri".into(),
+                    format!("mysql://{user}:{password}@{host}:{port}/{database}"),
                 );
                 out.insert("host".into(), host);
             }

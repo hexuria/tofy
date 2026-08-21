@@ -174,7 +174,7 @@ fn merge_engine_outputs(parsed: &Value, spec: &Project, state: &mut State) -> Re
             .get_mut(&r.name)
             .ok_or_else(|| Error::Engine(format!("missing prepared state for {}", r.name)))?;
         match r.kind {
-            Kind::Postgres => {
+            Kind::Postgres | Kind::Mysql => {
                 let host = output_string(parsed, &format!("{}_host", r.name))?;
                 let port = output_string(parsed, &format!("{}_port", r.name))
                     .unwrap_or_else(|_| rs.port.to_string());
@@ -189,12 +189,16 @@ fn merge_engine_outputs(parsed: &Value, spec: &Project, state: &mut State) -> Re
                     .get("database")
                     .cloned()
                     .unwrap_or_else(|| r.name.replace('-', "_"));
+                let scheme = match r.kind {
+                    Kind::Mysql => "mysql",
+                    _ => "postgres",
+                };
                 rs.port = port.parse().unwrap_or(rs.port);
                 rs.outputs.insert("host".into(), host.clone());
                 rs.outputs.insert("port".into(), port.clone());
                 rs.outputs.insert(
                     "uri".into(),
-                    format!("postgres://{user}:{password}@{host}:{port}/{database}"),
+                    format!("{scheme}://{user}:{password}@{host}:{port}/{database}"),
                 );
             }
             Kind::Redis => {
@@ -294,13 +298,13 @@ pub(crate) enum CidrMode {
 pub(crate) fn needs_engine_sg(spec: &Project) -> bool {
     spec.resources
         .iter()
-        .any(|r| matches!(r.kind, Kind::Postgres | Kind::Redis))
+        .any(|r| matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Redis))
 }
 
 pub(crate) fn needs_applier_cidr(spec: &Project) -> bool {
-    spec.resources
-        .iter()
-        .any(|r| matches!(r.kind, Kind::Postgres | Kind::Redis) && r.bind == Bind::Localhost)
+    spec.resources.iter().any(|r| {
+        matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Redis) && r.bind == Bind::Localhost
+    })
 }
 
 pub(crate) fn prepare_emit(spec: &Project, state: &mut State, mode: CidrMode) -> Result<()> {

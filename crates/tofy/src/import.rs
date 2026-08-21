@@ -138,7 +138,7 @@ pub fn kind_from_image(image: &str) -> Result<(Kind, Option<String>)> {
     let (name, tag) = split_name_tag(image);
     let kind = kind_from_name(name).ok_or_else(|| {
         Error::Usage(format!(
-            "unknown compose image {image:?}; importer maps postgres, redis, and minio/minio only"
+            "unknown compose image {image:?}; importer maps postgres, redis, mysql, and minio/minio only"
         ))
     })?;
     Ok((kind, tag.map(|s| s.to_string())))
@@ -163,6 +163,7 @@ fn kind_from_name(name: &str) -> Option<Kind> {
     let base = name.rsplit('/').next().unwrap_or(name);
     match base {
         "postgres" => Some(Kind::Postgres),
+        "mysql" => Some(Kind::Mysql),
         "redis" => Some(Kind::Redis),
         _ => None,
     }
@@ -409,5 +410,25 @@ services:
         let (kind, tag) = kind_from_image("docker.io/library/postgres:16").unwrap();
         assert_eq!(kind, Kind::Postgres);
         assert_eq!(tag.as_deref(), Some("16"));
+    }
+
+    #[test]
+    fn mysql_image_maps_kind() {
+        let (kind, tag) = kind_from_image("mysql:8").unwrap();
+        assert_eq!(kind, Kind::Mysql);
+        assert_eq!(tag.as_deref(), Some("8"));
+        let yaml = r#"
+name: demo
+services:
+  appmysql:
+    image: mysql:8
+    ports:
+      - "127.0.0.1:3307:3306"
+"#;
+        let spec = from_compose_str(yaml, None, Backend::Local, None).unwrap();
+        let r = spec.resource("appmysql").unwrap();
+        assert_eq!(r.kind, Kind::Mysql);
+        assert_eq!(r.port, Some(3307));
+        assert_eq!(r.bind, Bind::Localhost);
     }
 }

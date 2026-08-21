@@ -36,6 +36,7 @@ pub enum Applied {}
 pub trait ResourceDecl: Into<Resource> {}
 
 impl ResourceDecl for Postgres<Open> {}
+impl ResourceDecl for Mysql<Open> {}
 impl ResourceDecl for Redis<Open> {}
 impl ResourceDecl for Bucket<Open> {}
 
@@ -78,6 +79,54 @@ impl From<Postgres<Open>> for Resource {
         Resource {
             name: p.name,
             kind: Kind::Postgres,
+            version: p.version,
+            port: p.port,
+            size: p.size,
+            bind: p.bind,
+            replicas: 1,
+        }
+    }
+}
+
+/// Mysql resource declaration. Not a database client.
+/// `Mysql<Open>` has version/port/size/bind. There is no `.replicas()`.
+#[derive(Debug, Clone)]
+pub struct Mysql<S> {
+    name: String,
+    version: Option<String>,
+    port: Option<u16>,
+    size: Size,
+    bind: Bind,
+    _state: PhantomData<S>,
+}
+
+impl Mysql<Open> {
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    pub fn size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn bind(mut self, bind: Bind) -> Self {
+        self.bind = bind;
+        self
+    }
+}
+
+impl From<Mysql<Open>> for Resource {
+    fn from(p: Mysql<Open>) -> Self {
+        Resource {
+            name: p.name,
+            kind: Kind::Mysql,
             version: p.version,
             port: p.port,
             size: p.size,
@@ -315,6 +364,17 @@ pub fn postgres(name: impl Into<String>) -> Postgres<Open> {
     }
 }
 
+pub fn mysql(name: impl Into<String>) -> Mysql<Open> {
+    Mysql {
+        name: name.into(),
+        version: None,
+        port: None,
+        size: Size::Small,
+        bind: Bind::Localhost,
+        _state: PhantomData,
+    }
+}
+
 pub fn redis(name: impl Into<String>) -> Redis<Open> {
     Redis {
         name: name.into(),
@@ -358,11 +418,17 @@ mod tests {
             .bind(Bind::Localhost);
         let cache = redis("cache").size(Size::Medium);
         let files = bucket("uploads");
-        let project = stack("demo").add(db).add(cache).add(files).into_project();
+        let sql = mysql("appmysql").port(3307).version("8");
+        let project = stack("demo")
+            .add(db)
+            .add(cache)
+            .add(files)
+            .add(sql)
+            .into_project();
         assert_eq!(project.project, "demo");
         assert_eq!(project.backend, Backend::Local);
         assert_eq!(project.docker_network(), "tofy-demo");
-        assert_eq!(project.resources.len(), 3);
+        assert_eq!(project.resources.len(), 4);
         assert_eq!(project.resources[0].name, "appdb");
         assert_eq!(project.resources[0].kind, Kind::Postgres);
         assert_eq!(project.resources[0].port, Some(5433));
@@ -373,6 +439,9 @@ mod tests {
         assert_eq!(project.resources[1].size, Size::Medium);
         assert_eq!(project.resources[2].kind, Kind::Bucket);
         assert_eq!(project.resources[2].replicas, 1);
+        assert_eq!(project.resources[3].kind, Kind::Mysql);
+        assert_eq!(project.resources[3].port, Some(3307));
+        assert_eq!(project.resources[3].version.as_deref(), Some("8"));
     }
 
     #[test]

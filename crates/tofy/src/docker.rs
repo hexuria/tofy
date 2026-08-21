@@ -282,7 +282,7 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
     let net = docker_network(&spec.project);
     let hostname = r.name.clone();
 
-    if matches!(r.kind, Kind::Postgres | Kind::Bucket) {
+    if matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Bucket) {
         let mut vc = Command::new("docker");
         vc.args(["volume", "create", &vol]);
         vc.stdout(Stdio::null());
@@ -337,6 +337,24 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
             cmd.args(["-v", &format!("{vol}:/var/lib/postgresql/data")]);
             cmd.arg(docker_image(r));
         }
+        Kind::Mysql => {
+            let user = rs.outputs.get("user").map(String::as_str).unwrap_or("tofy");
+            let password = rs
+                .outputs
+                .get("password")
+                .ok_or_else(|| Error::Engine("mysql password missing from state".into()))?;
+            let database = rs
+                .outputs
+                .get("database")
+                .map(String::as_str)
+                .unwrap_or(r.name.as_str());
+            cmd.args(["-e", &format!("MYSQL_USER={user}")]);
+            cmd.args(["-e", &format!("MYSQL_PASSWORD={password}")]);
+            cmd.args(["-e", &format!("MYSQL_DATABASE={database}")]);
+            cmd.args(["-e", &format!("MYSQL_ROOT_PASSWORD={password}")]);
+            cmd.args(["-v", &format!("{vol}:/var/lib/mysql")]);
+            cmd.arg(docker_image(r));
+        }
         Kind::Redis => {
             let password = rs
                 .outputs
@@ -384,6 +402,13 @@ pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Resul
 pub fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<()> {
     match r.kind {
         Kind::Postgres => wait_for_postgres(container, rs.port),
+        Kind::Mysql => {
+            let password = rs
+                .outputs
+                .get("password")
+                .ok_or_else(|| Error::Engine("mysql password missing from state".into()))?;
+            wait_for_mysql(container, rs.port, password)
+        }
         Kind::Redis => {
             let password = rs
                 .outputs
@@ -426,6 +451,21 @@ pub fn wait_for_postgres(container: &str, port: u16) -> Result<()> {
         if Instant::now() >= deadline {
             return Err(Error::Engine(format!(
                 "Postgres on 127.0.0.1:{port} (container {container}) did not accept connections within 60s"
+            )));
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+}
+
+pub fn wait_for_mysql(container: &str, port: u16, password: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if mysql_ready(container, port, password) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Engine(format!(
+                "Mysql on 127.0.0.1:{port} (container {container}) did not accept connections within 60s"
             )));
         }
         thread::sleep(Duration::from_millis(400));
@@ -502,6 +542,28 @@ fn pg_ready(container: &str, port: u16) -> bool {
             "5432",
             "-U",
             "tofy",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    exec_ok || tcp_open(port)
+}
+
+fn mysql_ready(container: &str, port: u16, password: &str) -> bool {
+    let pass = format!("-p{password}");
+    let exec_ok = Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "mysqladmin",
+            "ping",
+            "-h",
+            "127.0.0.1",
+            "-uroot",
+            &pass,
+            "--silent",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

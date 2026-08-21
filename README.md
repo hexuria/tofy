@@ -104,7 +104,7 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 
 ## Size and bind
 
-Attributes, not new resource types. Language stays `postgres`, `redis`, `bucket`.
+Attributes, not new resource types. Language stays `postgres`, `mysql`, `redis`, `bucket`.
 
 | size | local Docker and OpenTofu docker provider | AWS (`Backend::Aws`) |
 | --- | --- | --- |
@@ -112,7 +112,7 @@ Attributes, not new resource types. Language stays `postgres`, `redis`, `bucket`
 | `medium` | 512MiB, 0.50 CPU | RDS `db.t4g.small`, ElastiCache `cache.t4g.small`, S3 `STANDARD` |
 | `large` | 1GiB, 1.00 CPU | RDS `db.t4g.medium`, ElastiCache `cache.t4g.medium`, S3 `STANDARD` |
 
-The local backend has no HA. There is no `.replicas()` on `postgres`, `redis`, or `bucket`. The IR field exists (default 1) for a later backend. `replicas > 1` in JSON is rejected: `local backend has no HA`. Plan treats size and bind changes as updates.
+The local backend has no HA. There is no `.replicas()` on `postgres`, `mysql`, `redis`, or `bucket`. The IR field exists (default 1) for a later backend. `replicas > 1` in JSON is rejected: `local backend has no HA`. Plan treats size and bind changes as updates.
 
 `.bind(Bind::Localhost)` (default) or `.bind(Bind::All)` (`0.0.0.0`) is who can reach the **published** port. In-stack traffic still uses the private network. Redis always has `requirepass` (password in `TOFY_CACHE_PASSWORD` / URI) so `Bind::All` is not an open unauthenticated Redis.
 

@@ -38,6 +38,7 @@ impl Backend {
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Postgres,
+    Mysql,
     Redis,
     Bucket,
 }
@@ -46,6 +47,7 @@ impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Kind::Postgres => write!(f, "postgres"),
+            Kind::Mysql => write!(f, "mysql"),
             Kind::Redis => write!(f, "redis"),
             Kind::Bucket => write!(f, "bucket"),
         }
@@ -166,6 +168,7 @@ impl Kind {
     pub fn default_port(self) -> u16 {
         match self {
             Kind::Postgres => 5432,
+            Kind::Mysql => 3306,
             Kind::Redis => 6379,
             Kind::Bucket => 9000,
         }
@@ -174,6 +177,7 @@ impl Kind {
     pub fn default_version(self) -> &'static str {
         match self {
             Kind::Postgres => "16",
+            Kind::Mysql => "8",
             Kind::Redis => "7",
             Kind::Bucket => "latest",
         }
@@ -543,7 +547,7 @@ mod tests {
 
     #[test]
     fn local_backend_rejects_replicas() {
-        for typ in ["postgres", "redis", "bucket"] {
+        for typ in ["postgres", "mysql", "redis", "bucket"] {
             let err = Project::from_json_str(&format!(
                 r#"{{"project":"demo","resources":[{{"name":"x","type":"{typ}","replicas":2}}]}}"#
             ))
