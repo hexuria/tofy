@@ -77,7 +77,10 @@ pub fn compose_yaml(spec: &Project, state: &State) -> String {
         let (env, cmd) = container_env(r.kind, &outs);
         s.push_str(&format!("  {}:\n", r.name));
         s.push_str(&format!("    image: {}\n", docker_image(r)));
-        s.push_str(&format!("    container_name: tofy-{}-{}\n", spec.project, r.name));
+        s.push_str(&format!(
+            "    container_name: tofy-{}-{}\n",
+            spec.project, r.name
+        ));
         s.push_str(&format!(
             "    ports:\n      - \"127.0.0.1:{}:{}\"\n",
             r.port_or_default(),
@@ -113,11 +116,17 @@ fn sanitize(name: &str) -> String {
     name.replace('-', "_")
 }
 
-fn container_env(kind: Kind, outs: &BTreeMap<String, String>) -> (Vec<String>, Option<Vec<String>>) {
+fn container_env(
+    kind: Kind,
+    outs: &BTreeMap<String, String>,
+) -> (Vec<String>, Option<Vec<String>>) {
     match kind {
         Kind::Postgres => (
             vec![
-                format!("POSTGRES_USER={}", outs.get("user").map(String::as_str).unwrap_or("tofy")),
+                format!(
+                    "POSTGRES_USER={}",
+                    outs.get("user").map(String::as_str).unwrap_or("tofy")
+                ),
                 format!(
                     "POSTGRES_PASSWORD={}",
                     outs.get("password").map(String::as_str).unwrap_or("")

@@ -62,10 +62,7 @@ fn run_checked(mut cmd: Command) -> Result<()> {
     let out = cmd.output()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(Error::Engine(format!(
-            "docker failed: {}",
-            stderr.trim()
-        )));
+        return Err(Error::Engine(format!("docker failed: {}", stderr.trim())));
     }
     Ok(())
 }

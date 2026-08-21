@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tofy_spec::{Kind, Project, Resource};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -145,8 +145,10 @@ pub fn outputs_for(
             out.insert("port".into(), port.to_string());
         }
         Kind::Bucket => {
-            let access_key = existing_output(have, "access_key").unwrap_or_else(|| generate_secret(16));
-            let secret_key = existing_output(have, "secret_key").unwrap_or_else(|| generate_secret(32));
+            let access_key =
+                existing_output(have, "access_key").unwrap_or_else(|| generate_secret(16));
+            let secret_key =
+                existing_output(have, "secret_key").unwrap_or_else(|| generate_secret(32));
             out.insert("endpoint".into(), format!("http://127.0.0.1:{port}"));
             out.insert("access_key".into(), access_key);
             out.insert("secret_key".into(), secret_key);

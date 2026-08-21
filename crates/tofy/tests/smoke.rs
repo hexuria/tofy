@@ -61,7 +61,10 @@ fn smoke_apply_example_if_docker() {
     assert!(root.join(".tofy").join("spec.json").exists());
 
     let second = engine::apply(root, &spec).expect("second apply");
-    assert!(second.contains("No changes.") || !second.contains("+ create"), "{second}");
+    assert!(
+        second.contains("No changes.") || !second.contains("+ create"),
+        "{second}"
+    );
     let outs2 = outputs::load(root).unwrap();
     assert_eq!(password, outs2["TOFY_APPDB_PASSWORD"]);
 
