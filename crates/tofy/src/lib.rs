@@ -4,6 +4,7 @@
 pub use tofy_macros::main;
 pub use tofy_spec as spec;
 
+pub mod aws;
 pub mod builder;
 pub mod cli;
 pub mod docker;

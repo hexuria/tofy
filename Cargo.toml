@@ -6,6 +6,7 @@ members = [
     "crates/tofy",
     "examples/infra",
     "examples/infra-tofu",
+    "examples/infra-aws",
 ]
 
 [workspace.package]

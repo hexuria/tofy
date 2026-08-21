@@ -3,6 +3,7 @@ use std::path::Path;
 
 use tofy_spec::{replica_container, Backend, Kind, Project};
 
+use crate::aws;
 use crate::docker::{self, ContainerFacts, ContainerLive};
 use crate::emit;
 use crate::error::{Error, Result};
@@ -210,6 +211,10 @@ pub fn plan_text(root: &Path, spec: &Project) -> Result<String> {
             let next = prepare_state(spec, &current);
             tofu::plan(root, spec, &next)
         }
+        Backend::Aws => {
+            let next = prepare_state(spec, &current);
+            aws::plan(root, spec, &next)
+        }
     }
 }
 
@@ -225,6 +230,7 @@ pub fn apply(root: &Path, spec: &Project) -> Result<String> {
     match spec.backend {
         Backend::Local => apply_local(root, spec, &current, &actions, &mut next),
         Backend::Tofu => apply_tofu(root, spec, &actions, &mut next),
+        Backend::Aws => apply_aws(root, spec, &actions, &mut next),
     }
 }
 
@@ -324,6 +330,26 @@ fn apply_tofu(root: &Path, spec: &Project, actions: &[Action], next: &mut State)
     Ok(applied_message(actions))
 }
 
+fn apply_aws(root: &Path, spec: &Project, actions: &[Action], next: &mut State) -> Result<String> {
+    emit::write_tofu_config(root, spec, next)?;
+    if !tofu::available() {
+        return emit_without_engine(root, actions, next, Error::TofuMissing);
+    }
+    if !aws::credentials_available() {
+        return emit_without_engine(root, actions, next, Error::AwsCredentialsMissing);
+    }
+
+    state::mark_emitted(next);
+    next.save(root)?;
+
+    aws::apply(root, spec, next)?;
+
+    state::mark_applied(next);
+    next.save(root)?;
+    outputs::write(root, next)?;
+    Ok(applied_message(actions))
+}
+
 pub fn destroy(root: &Path) -> Result<String> {
     let _lock = Lock::acquire(root)?;
     let mut current = State::load(root)?;
@@ -334,6 +360,7 @@ pub fn destroy(root: &Path) -> Result<String> {
     match current.backend {
         Backend::Local => destroy_local(root, &mut current),
         Backend::Tofu => destroy_tofu(root, &mut current),
+        Backend::Aws => destroy_aws(root, &mut current),
     }
 }
 
@@ -366,11 +393,29 @@ fn destroy_tofu(root: &Path, current: &mut State) -> Result<String> {
     Ok("Destroyed resources and cleared state.\n".into())
 }
 
+fn destroy_aws(root: &Path, current: &mut State) -> Result<String> {
+    if !tofu::available() {
+        return Err(Error::DestroyNeedsTofu);
+    }
+    if !aws::credentials_available() {
+        return Err(Error::DestroyNeedsAwsCredentials);
+    }
+    aws::destroy(root, current)?;
+    current.clear_resources();
+    current.save(root)?;
+    outputs::clear(root)?;
+    Ok("Destroyed resources and cleared state.\n".into())
+}
+
 pub fn emit(root: &Path, spec: &Project) -> Result<String> {
     spec.validate()?;
     let current = State::load(root)?;
     let next = prepare_state(spec, &current);
     emit::write_artifacts(root, spec, &next)?;
+    if spec.backend == Backend::Aws {
+        emit::write_tofu_config(root, spec, &next)?;
+        return Ok("Wrote .tofy/spec.json and .tofy/main.tf.json\n".into());
+    }
     Ok("Wrote .tofy/spec.json\n".into())
 }
 
@@ -826,6 +871,195 @@ mod tests {
         );
         let current = State::load(dir.path()).unwrap();
         assert!(current
+            .resources
+            .values()
+            .all(|r| r.status != crate::state::Status::Applied));
+    }
+
+    fn aws_spec(resources: &[(&str, Kind, Option<u16>)]) -> Project {
+        let mut p = spec(resources);
+        p.project = "demoaws".into();
+        p.backend = Backend::Aws;
+        p
+    }
+
+    fn without_aws_env<T>(f: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_PROFILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONFIG_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        ];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        let out = f();
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        out
+    }
+
+    #[test]
+    fn apply_without_aws_credentials_emits_and_does_not_claim_applied() {
+        without_aws_env(|| {
+            assert!(!aws::credentials_available());
+            let dir = tempfile::tempdir().unwrap();
+            let spec = aws_spec(&[
+                ("appdb", Kind::Postgres, Some(25432)),
+                ("cache", Kind::Redis, Some(26379)),
+                ("uploads", Kind::Bucket, None),
+            ]);
+            let err = apply(dir.path(), &spec).unwrap_err();
+            let msg = err.to_string();
+            assert!(!msg.contains("Applied"), "{msg}");
+            assert!(!msg.contains("Destroyed"), "{msg}");
+            assert!(!msg.to_lowercase().contains("go run"), "{msg}");
+            assert!(!msg.contains("tofu apply"), "{msg}");
+            if tofu::available() {
+                assert!(matches!(err, Error::AwsCredentialsMissing), "{err}");
+                assert!(msg.contains("AWS credentials were not found"), "{msg}");
+            } else {
+                assert!(matches!(err, Error::TofuMissing), "{err}");
+                assert!(msg.contains("OpenTofu engine is required"), "{msg}");
+            }
+            assert!(dir.path().join(".tofy").join("spec.json").exists());
+            assert!(dir.path().join(".tofy").join("main.tf.json").exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(dir.path().join(".tofy").join("main.tf.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+            let tf = std::fs::read_to_string(dir.path().join(".tofy").join("main.tf.json")).unwrap();
+            assert!(tf.contains("hashicorp/aws"));
+            assert!(!tf.contains("kreuzwerker/docker"));
+            let loaded = State::load(dir.path()).unwrap();
+            assert_eq!(loaded.backend, Backend::Aws);
+            assert!(loaded
+                .resources
+                .values()
+                .all(|r| r.status != crate::state::Status::Applied));
+        });
+    }
+
+    #[test]
+    fn destroy_without_aws_credentials_leaves_state() {
+        without_aws_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = aws_spec(&[("uploads", Kind::Bucket, None)]);
+            let state = prepare_state(&spec, &State::default());
+            state.save(dir.path()).unwrap();
+            outputs::write(dir.path(), &state).unwrap();
+            let before =
+                std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
+            let err = destroy(dir.path()).unwrap_err();
+            let msg = err.to_string();
+            assert!(!msg.contains("Destroyed"), "{msg}");
+            assert!(!msg.contains("Applied"), "{msg}");
+            if tofu::available() {
+                assert!(matches!(err, Error::DestroyNeedsAwsCredentials), "{err}");
+                assert!(msg.contains("AWS credentials were not found"), "{msg}");
+            } else {
+                assert!(matches!(err, Error::DestroyNeedsTofu), "{err}");
+            }
+            let after =
+                std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
+            assert_eq!(before, after);
+            assert!(dir.path().join(".tofy").join("outputs.env").exists());
+        });
+    }
+
+    #[test]
+    fn aws_plan_without_credentials_or_tofu_errors_and_does_not_claim_no_changes() {
+        without_aws_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = aws_spec(&[
+                ("appdb", Kind::Postgres, Some(25432)),
+                ("cache", Kind::Redis, Some(26379)),
+                ("uploads", Kind::Bucket, None),
+            ]);
+            let err = plan_text(dir.path(), &spec).unwrap_err();
+            let msg = err.to_string();
+            assert!(!msg.contains("No changes."), "{msg}");
+            assert!(!msg.contains("Applied"), "{msg}");
+            assert!(!msg.to_lowercase().contains("go run"), "{msg}");
+            assert!(!msg.contains("tofu plan"), "{msg}");
+            if tofu::available() {
+                assert!(matches!(err, Error::PlanNeedsAwsCredentials), "{err}");
+                assert!(msg.contains("AWS credentials were not found"), "{msg}");
+            } else {
+                assert!(matches!(err, Error::PlanNeedsTofu), "{err}");
+                assert!(msg.contains("OpenTofu engine is required"), "{msg}");
+            }
+            let loaded = State::load(dir.path()).unwrap();
+            assert!(loaded
+                .resources
+                .values()
+                .all(|r| r.status != crate::state::Status::Applied));
+            let main = dir.path().join(".tofy").join("main.tf.json");
+            assert!(main.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&main).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+        });
+    }
+
+    #[test]
+    fn emit_writes_aws_opentofu_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = aws_spec(&[
+            ("appdb", Kind::Postgres, Some(25432)),
+            ("uploads", Kind::Bucket, None),
+        ]);
+        let msg = emit(dir.path(), &spec).unwrap();
+        assert!(msg.contains("spec.json"), "{msg}");
+        let main = dir.path().join(".tofy").join("main.tf.json");
+        assert!(main.exists());
+        let tf: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&main).unwrap()).unwrap();
+        assert_eq!(
+            tf["terraform"]["required_providers"]["aws"]["source"],
+            "hashicorp/aws"
+        );
+        assert!(tf["resource"].get("aws_db_instance").is_some());
+        assert!(tf["resource"].get("aws_s3_bucket").is_some());
+        assert!(tf["resource"].get("aws_vpc").is_none());
+        let spec_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".tofy").join("spec.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec_json["backend"], "aws");
+        let current = State::load(dir.path()).unwrap();
+        assert!(current.resources.is_empty() || current
             .resources
             .values()
             .all(|r| r.status != crate::state::Status::Applied));

@@ -72,11 +72,11 @@ fn wait_ready(spec: &Project, state: &State) -> Result<()> {
     Ok(())
 }
 
-fn run(root: &Path, args: &[&str], secrets: &[String]) -> Result<()> {
+pub(crate) fn run(root: &Path, args: &[&str], secrets: &[String]) -> Result<()> {
     run_output(root, args, secrets).map(|_| ())
 }
 
-fn run_output(root: &Path, args: &[&str], secrets: &[String]) -> Result<String> {
+pub(crate) fn run_output(root: &Path, args: &[&str], secrets: &[String]) -> Result<String> {
     let dir = root.join(".tofy");
     std::fs::create_dir_all(&dir)?;
     let mut cmd = Command::new("tofu");
@@ -104,7 +104,7 @@ fn run_output(root: &Path, args: &[&str], secrets: &[String]) -> Result<String> 
     Ok(redacted)
 }
 
-fn secret_values(state: &State) -> Vec<String> {
+pub(crate) fn secret_values(state: &State) -> Vec<String> {
     let mut out = Vec::new();
     for rs in state.resources.values() {
         for (key, value) in &rs.outputs {

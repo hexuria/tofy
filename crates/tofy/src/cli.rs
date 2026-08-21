@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Cmd {
-    /// Local: live Docker vs state. Tofu: OpenTofu engine plan.
+    /// Local: live Docker vs state. Tofu / Aws: OpenTofu engine plan.
     Plan,
     /// Create, update, and delete resources
     Apply,
