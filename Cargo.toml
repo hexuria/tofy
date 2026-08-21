@@ -8,6 +8,7 @@ members = [
     "examples/infra",
     "examples/infra-tofu",
     "examples/infra-aws",
+    "examples/infra-mysql",
 ]
 
 [workspace.package]

@@ -130,3 +130,36 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ""
           AWS_SESSION_TOKEN: ""
           AWS_PROFILE: ""
+
+  test-and-apply-mysql:
+    name: test and mysql apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.83.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-mysql-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-mysql-
+            ${{ runner.os }}-cargo-
+
+      - name: Require Docker
+        run: docker info
+
+      - name: Install host probe
+        run: sudo apt-get update && sudo apt-get install -y default-mysql-client
+
+      - name: Apply, probe, and destroy
+        run: bash scripts/ci-smoke-mysql.sh
