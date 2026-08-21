@@ -21,7 +21,7 @@ Rust typestate builders (`Foo<S>` + `PhantomData`) and `#[tofy::main]` are the w
 
 No AWS RDS, VPC, Multi-AZ, or “run tofu yourself.” Default apply stays the local Docker engine.
 
-## Phase 2 — this PR
+## Phase 2 — merged
 
 A real OpenTofu backend. `Backend::Tofu` is no longer a dead enum. When the spec backend is Tofu, `tofy apply` / `tofy destroy` run the OpenTofu engine (`tofu init` / apply / destroy) against an emitted docker-provider configuration.
 
@@ -37,11 +37,18 @@ A real OpenTofu backend. `Backend::Tofu` is no longer a dead enum. When the spec
 - Phase 1 `scripts/ci-smoke.sh` stays the local Docker job and still requires Docker
 - No RDS, Multi-AZ, VPC, subnets, security groups, load balancers, IAM, or autoscaler
 
-## Phase 3 — drift and polish
+## Phase 3 — this PR
 
-- Drift: refresh live containers vs state, show a plan when reality diverged
-- Surface lock / drift in CI (provision CI is already phase 1 / 2)
-- Polish: errors, output formatting, docs
+Drift, a real apply lock, and CI that fails if either is broken.
+
+- `tofy plan` (and apply's plan) refresh live containers vs `.tofy/state.json`. A stopped, missing, or remapped container (image / published port / bind / labels) is a change, with a reason (`not running`, `port changed`). Passwords stay out of the plan text.
+- Local apply heals: `ensure_running` for a stopped match, recreate if the container is gone or wrong. Tofu apply runs the OpenTofu engine (this phase still uses the docker provider; plan uses the same Docker inspect so a stopped container is not ignored).
+- Exclusive `flock` on `.tofy/lock` for the lifetime of apply/destroy. A second apply in the same directory is `Locked`. Process death releases the lock (no stale pid-file).
+- Both required smokes stay. After apply, stop a container: plan must not print `No changes.`, apply heals, probes still pass, destroy still works. `cargo test` holds the lock and asserts apply/destroy return `Locked`.
+- Error strings stay honest: missing Docker / missing tofu / Locked do not print Applied or Destroyed.
+- These docs: `README.md`, this file, `docs/api.md`
+
+No AWS, no new kinds, no PgPool.
 
 ## Later
 

@@ -67,6 +67,34 @@ fn smoke_apply_example_if_docker() {
     let outs2 = outputs::load(root).unwrap();
     assert_eq!(password, outs2["TOFY_APPDB_PASSWORD"]);
 
+    let cache = tofy::spec::replica_container(&spec.project, "cache", 0);
+    assert!(
+        std::process::Command::new("docker")
+            .args(["stop", &cache])
+            .status()
+            .unwrap()
+            .success(),
+        "docker stop {cache}"
+    );
+    let drifted = engine::plan_text(root, &spec).expect("plan after stop");
+    assert!(!drifted.contains("No changes."), "{drifted}");
+    assert!(
+        drifted.contains("not running")
+            || drifted.contains("~ update")
+            || drifted.contains("+ create"),
+        "{drifted}"
+    );
+    assert!(!drifted.to_lowercase().contains("password"), "{drifted}");
+    let healed = engine::apply(root, &spec).expect("heal drift");
+    assert!(healed.contains("Applied."), "{healed}");
+    assert!(!healed.to_lowercase().contains("password"), "{healed}");
+    assert!(
+        docker::container_running(&cache),
+        "apply should restart {cache}"
+    );
+    let clean = engine::plan_text(root, &spec).expect("plan after heal");
+    assert!(clean.contains("No changes."), "{clean}");
+
     let destroyed = engine::destroy(root).expect("destroy");
     assert!(destroyed.contains("Destroyed"), "{destroyed}");
     assert!(!Path::new(&root.join(".tofy").join("outputs.env")).exists());
@@ -124,6 +152,32 @@ fn smoke_apply_tofu_if_available() {
         .resources
         .values()
         .all(|r| r.status == tofy::state::Status::Applied));
+
+    let cache = tofy::spec::replica_container(&spec.project, "cache", 0);
+    assert!(
+        std::process::Command::new("docker")
+            .args(["stop", &cache])
+            .status()
+            .unwrap()
+            .success(),
+        "docker stop {cache}"
+    );
+    let drifted = engine::plan_text(root, &spec).expect("tofu plan after stop");
+    assert!(!drifted.contains("No changes."), "{drifted}");
+    assert!(
+        drifted.contains("not running")
+            || drifted.contains("~ update")
+            || drifted.contains("+ create"),
+        "{drifted}"
+    );
+    assert!(!drifted.to_lowercase().contains("password"), "{drifted}");
+    let healed = engine::apply(root, &spec).expect("tofu heal drift");
+    assert!(healed.contains("Applied."), "{healed}");
+    assert!(!healed.to_lowercase().contains("go run tofu"), "{healed}");
+    assert!(
+        docker::container_running(&cache),
+        "tofu apply should restart {cache}"
+    );
 
     let destroyed = engine::destroy(root).expect("tofu destroy");
     assert!(destroyed.contains("Destroyed"), "{destroyed}");

@@ -497,6 +497,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "libc",
  "rand",
  "serde",
  "serde_json",

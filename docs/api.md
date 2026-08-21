@@ -39,6 +39,8 @@ The local backend has no HA. `replicas` is not a method on any Open builder. If 
 
 `.apply()` on `Stack<NonEmpty>` calls `engine::apply` and only then returns `Stack<Applied>`. `cargo run -p infra` with no verb still applies.
 
+`tofy plan` (and `Stack::plan`) refresh live Docker containers against `.tofy/state.json`. Reality that diverged — not running, missing, wrong image / published port / bind / labels — shows as a create or update, with a reason. Apply heals that drift. Plan text does not print passwords.
+
 `cargo run -- plan` (and destroy / output / run / emit) still work: `apply()` sees the CLI verb, performs that verb, and **exits without returning Applied**. The type is not a lie.
 
 ## Compile-fail cases

@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Cmd {
-    /// Diff the declared stack against .tofy/state.json
+    /// Refresh live containers vs .tofy/state.json and print the plan
     Plan,
     /// Create, update, and delete resources
     Apply,

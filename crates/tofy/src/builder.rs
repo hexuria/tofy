@@ -216,7 +216,7 @@ impl Stack<NonEmpty> {
         self
     }
 
-    /// Print the plan against `.tofy/state.json`. Consumes the stack.
+    /// Print the plan against `.tofy/state.json` and live containers. Consumes the stack.
     pub fn plan(self) {
         mark_stack_closed();
         let root = workdir();
