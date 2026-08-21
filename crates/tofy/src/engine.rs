@@ -410,10 +410,10 @@ fn destroy_aws(root: &Path, current: &mut State) -> Result<String> {
 pub fn emit(root: &Path, spec: &Project) -> Result<String> {
     spec.validate()?;
     let current = State::load(root)?;
-    let next = prepare_state(spec, &current);
+    let mut next = prepare_state(spec, &current);
     emit::write_artifacts(root, spec, &next)?;
     if spec.backend == Backend::Aws {
-        emit::write_tofu_config(root, spec, &next)?;
+        emit::write_tofu_config(root, spec, &mut next)?;
         return Ok("Wrote .tofy/spec.json and .tofy/main.tf.json\n".into());
     }
     Ok("Wrote .tofy/spec.json\n".into())
@@ -924,47 +924,54 @@ mod tests {
     #[test]
     fn apply_without_aws_credentials_emits_and_does_not_claim_applied() {
         without_aws_env(|| {
-            assert!(!aws::credentials_available());
-            let dir = tempfile::tempdir().unwrap();
-            let spec = aws_spec(&[
-                ("appdb", Kind::Postgres, Some(25432)),
-                ("cache", Kind::Redis, Some(26379)),
-                ("uploads", Kind::Bucket, None),
-            ]);
-            let err = apply(dir.path(), &spec).unwrap_err();
-            let msg = err.to_string();
-            assert!(!msg.contains("Applied"), "{msg}");
-            assert!(!msg.contains("Destroyed"), "{msg}");
-            assert!(!msg.to_lowercase().contains("go run"), "{msg}");
-            assert!(!msg.contains("tofu apply"), "{msg}");
-            if tofu::available() {
-                assert!(matches!(err, Error::AwsCredentialsMissing), "{err}");
-                assert!(msg.contains("AWS credentials were not found"), "{msg}");
-            } else {
-                assert!(matches!(err, Error::TofuMissing), "{err}");
-                assert!(msg.contains("OpenTofu engine is required"), "{msg}");
-            }
-            assert!(dir.path().join(".tofy").join("spec.json").exists());
-            assert!(dir.path().join(".tofy").join("main.tf.json").exists());
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(dir.path().join(".tofy").join("main.tf.json"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777;
-                assert_eq!(mode, 0o600);
-            }
-            let tf = std::fs::read_to_string(dir.path().join(".tofy").join("main.tf.json")).unwrap();
-            assert!(tf.contains("hashicorp/aws"));
-            assert!(!tf.contains("kreuzwerker/docker"));
-            let loaded = State::load(dir.path()).unwrap();
-            assert_eq!(loaded.backend, Backend::Aws);
-            assert!(loaded
-                .resources
-                .values()
-                .all(|r| r.status != crate::state::Status::Applied));
+            aws::with_applier_cidr("203.0.113.10/32", || {
+                assert!(!aws::credentials_available());
+                let dir = tempfile::tempdir().unwrap();
+                let spec = aws_spec(&[
+                    ("appdb", Kind::Postgres, Some(25432)),
+                    ("cache", Kind::Redis, Some(26379)),
+                    ("uploads", Kind::Bucket, None),
+                ]);
+                let err = apply(dir.path(), &spec).unwrap_err();
+                let msg = err.to_string();
+                assert!(!msg.contains("Applied"), "{msg}");
+                assert!(!msg.contains("Destroyed"), "{msg}");
+                assert!(!msg.to_lowercase().contains("go run"), "{msg}");
+                assert!(!msg.contains("tofu apply"), "{msg}");
+                if tofu::available() {
+                    assert!(matches!(err, Error::AwsCredentialsMissing), "{err}");
+                    assert!(msg.contains("AWS credentials were not found"), "{msg}");
+                } else {
+                    assert!(matches!(err, Error::TofuMissing), "{err}");
+                    assert!(msg.contains("OpenTofu engine is required"), "{msg}");
+                }
+                assert!(dir.path().join(".tofy").join("spec.json").exists());
+                assert!(dir.path().join(".tofy").join("main.tf.json").exists());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(dir.path().join(".tofy").join("main.tf.json"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
+                let tf =
+                    std::fs::read_to_string(dir.path().join(".tofy").join("main.tf.json")).unwrap();
+                assert!(tf.contains("hashicorp/aws"));
+                assert!(!tf.contains("kreuzwerker/docker"));
+                assert!(tf.contains("aws_security_group"));
+                assert!(tf.contains("203.0.113.10/32"));
+                assert!(!tf.contains("AWS_SECRET_ACCESS_KEY"));
+                let loaded = State::load(dir.path()).unwrap();
+                assert_eq!(loaded.backend, Backend::Aws);
+                assert_eq!(loaded.applier_cidr.as_deref(), Some("203.0.113.10/32"));
+                assert!(loaded
+                    .resources
+                    .values()
+                    .all(|r| r.status != crate::state::Status::Applied));
+            });
         });
     }
 
@@ -998,70 +1005,82 @@ mod tests {
     #[test]
     fn aws_plan_without_credentials_or_tofu_errors_and_does_not_claim_no_changes() {
         without_aws_env(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let spec = aws_spec(&[
-                ("appdb", Kind::Postgres, Some(25432)),
-                ("cache", Kind::Redis, Some(26379)),
-                ("uploads", Kind::Bucket, None),
-            ]);
-            let err = plan_text(dir.path(), &spec).unwrap_err();
-            let msg = err.to_string();
-            assert!(!msg.contains("No changes."), "{msg}");
-            assert!(!msg.contains("Applied"), "{msg}");
-            assert!(!msg.to_lowercase().contains("go run"), "{msg}");
-            assert!(!msg.contains("tofu plan"), "{msg}");
-            if tofu::available() {
-                assert!(matches!(err, Error::PlanNeedsAwsCredentials), "{err}");
-                assert!(msg.contains("AWS credentials were not found"), "{msg}");
-            } else {
-                assert!(matches!(err, Error::PlanNeedsTofu), "{err}");
-                assert!(msg.contains("OpenTofu engine is required"), "{msg}");
-            }
-            let loaded = State::load(dir.path()).unwrap();
-            assert!(loaded
-                .resources
-                .values()
-                .all(|r| r.status != crate::state::Status::Applied));
-            let main = dir.path().join(".tofy").join("main.tf.json");
-            assert!(main.exists());
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&main).unwrap().permissions().mode() & 0o777;
-                assert_eq!(mode, 0o600);
-            }
+            aws::with_applier_cidr("203.0.113.10/32", || {
+                let dir = tempfile::tempdir().unwrap();
+                let spec = aws_spec(&[
+                    ("appdb", Kind::Postgres, Some(25432)),
+                    ("cache", Kind::Redis, Some(26379)),
+                    ("uploads", Kind::Bucket, None),
+                ]);
+                let err = plan_text(dir.path(), &spec).unwrap_err();
+                let msg = err.to_string();
+                assert!(!msg.contains("No changes."), "{msg}");
+                assert!(!msg.contains("Applied"), "{msg}");
+                assert!(!msg.to_lowercase().contains("go run"), "{msg}");
+                assert!(!msg.contains("tofu plan"), "{msg}");
+                if tofu::available() {
+                    assert!(matches!(err, Error::PlanNeedsAwsCredentials), "{err}");
+                    assert!(msg.contains("AWS credentials were not found"), "{msg}");
+                } else {
+                    assert!(matches!(err, Error::PlanNeedsTofu), "{err}");
+                    assert!(msg.contains("OpenTofu engine is required"), "{msg}");
+                }
+                let loaded = State::load(dir.path()).unwrap();
+                assert!(loaded
+                    .resources
+                    .values()
+                    .all(|r| r.status != crate::state::Status::Applied));
+                let main = dir.path().join(".tofy").join("main.tf.json");
+                assert!(main.exists());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&main).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
+            });
         });
     }
 
     #[test]
     fn emit_writes_aws_opentofu_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let spec = aws_spec(&[
-            ("appdb", Kind::Postgres, Some(25432)),
-            ("uploads", Kind::Bucket, None),
-        ]);
-        let msg = emit(dir.path(), &spec).unwrap();
-        assert!(msg.contains("spec.json"), "{msg}");
-        let main = dir.path().join(".tofy").join("main.tf.json");
-        assert!(main.exists());
-        let tf: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&main).unwrap()).unwrap();
-        assert_eq!(
-            tf["terraform"]["required_providers"]["aws"]["source"],
-            "hashicorp/aws"
-        );
-        assert!(tf["resource"].get("aws_db_instance").is_some());
-        assert!(tf["resource"].get("aws_s3_bucket").is_some());
-        assert!(tf["resource"].get("aws_vpc").is_none());
-        let spec_json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".tofy").join("spec.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(spec_json["backend"], "aws");
-        let current = State::load(dir.path()).unwrap();
-        assert!(current.resources.is_empty() || current
-            .resources
-            .values()
-            .all(|r| r.status != crate::state::Status::Applied));
+        aws::with_applier_cidr("203.0.113.10/32", || {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = aws_spec(&[
+                ("appdb", Kind::Postgres, Some(25432)),
+                ("uploads", Kind::Bucket, None),
+            ]);
+            let msg = emit(dir.path(), &spec).unwrap();
+            assert!(msg.contains("spec.json"), "{msg}");
+            let main = dir.path().join(".tofy").join("main.tf.json");
+            assert!(main.exists());
+            let tf: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&main).unwrap()).unwrap();
+            assert_eq!(
+                tf["terraform"]["required_providers"]["aws"]["source"],
+                "hashicorp/aws"
+            );
+            assert!(tf["resource"].get("aws_db_instance").is_some());
+            assert!(tf["resource"].get("aws_s3_bucket").is_some());
+            assert!(tf["resource"].get("aws_vpc").is_none());
+            assert!(tf["resource"].get("aws_security_group").is_some());
+            assert_eq!(
+                tf["resource"]["aws_vpc_security_group_ingress_rule"]["appdb"]["cidr_ipv4"],
+                "203.0.113.10/32"
+            );
+            let spec_json: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join(".tofy").join("spec.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(spec_json["backend"], "aws");
+            let current = State::load(dir.path()).unwrap();
+            assert!(
+                current.resources.is_empty()
+                    || current
+                        .resources
+                        .values()
+                        .all(|r| r.status != crate::state::Status::Applied)
+            );
+        });
     }
 }

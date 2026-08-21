@@ -6,10 +6,13 @@
 //! config files). tofy does not mint, prompt, store, or commit credentials.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
-use tofy_spec::{Backend, Kind, Project};
+use tofy_spec::{Backend, Bind, Kind, Project};
 
 use crate::emit;
 use crate::error::{Error, Result};
@@ -54,7 +57,9 @@ pub fn region() -> Option<String> {
 }
 
 fn env_nonempty(key: &str) -> bool {
-    std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)
+    std::env::var(key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn credentials_file_path() -> PathBuf {
@@ -117,22 +122,24 @@ pub fn apply(root: &Path, spec: &Project, state: &mut State) -> Result<()> {
 /// Does not persist Applied status. Missing tofu or missing ambient AWS
 /// credentials is an error, not "No changes."
 pub fn plan(root: &Path, spec: &Project, state: &State) -> Result<String> {
-    emit::write_tofu_config(root, spec, state)?;
+    let mut emit_state = state.clone();
+    emit::write_tofu_config(root, spec, &mut emit_state)?;
     if !tofu::available() {
         return Err(Error::PlanNeedsTofu);
     }
     if !credentials_available() {
         return Err(Error::PlanNeedsAwsCredentials);
     }
-    let secrets = tofu::secret_values(state);
+    let secrets = tofu::secret_values(&emit_state);
     tofu::run(root, &["init", "-input=false", "-no-color"], &secrets)?;
     tofu::run_output(root, &["plan", "-input=false", "-no-color"], &secrets)
 }
 
 pub fn destroy(root: &Path, state: &State) -> Result<()> {
     let spec = state.as_project();
-    emit::write_tofu_config(root, &spec, state)?;
-    let secrets = tofu::secret_values(state);
+    let mut emit_state = state.clone();
+    emit::write_tofu_config_mode(root, &spec, &mut emit_state, CidrMode::PreferPersisted)?;
+    let secrets = tofu::secret_values(&emit_state);
     tofu::run(root, &["init", "-input=false", "-no-color"], &secrets)?;
     tofu::run(
         root,
@@ -150,9 +157,8 @@ fn refresh_outputs(
     secrets: &[String],
 ) -> Result<()> {
     let raw = tofu::run_output(root, &["output", "-json", "-no-color"], secrets)?;
-    let parsed: Value = serde_json::from_str(raw.trim()).map_err(|e| {
-        Error::Engine(format!("OpenTofu engine output was not JSON: {e}"))
-    })?;
+    let parsed: Value = serde_json::from_str(raw.trim())
+        .map_err(|e| Error::Engine(format!("OpenTofu engine output was not JSON: {e}")))?;
     merge_engine_outputs(&parsed, spec, state)
 }
 
@@ -172,7 +178,11 @@ fn merge_engine_outputs(parsed: &Value, spec: &Project, state: &mut State) -> Re
                 let host = output_string(parsed, &format!("{}_host", r.name))?;
                 let port = output_string(parsed, &format!("{}_port", r.name))
                     .unwrap_or_else(|_| rs.port.to_string());
-                let user = rs.outputs.get("user").cloned().unwrap_or_else(|| "tofy".into());
+                let user = rs
+                    .outputs
+                    .get("user")
+                    .cloned()
+                    .unwrap_or_else(|| "tofy".into());
                 let password = rs.outputs.get("password").cloned().unwrap_or_default();
                 let database = rs
                     .outputs
@@ -195,7 +205,8 @@ fn merge_engine_outputs(parsed: &Value, spec: &Project, state: &mut State) -> Re
                 rs.port = port.parse().unwrap_or(rs.port);
                 rs.outputs.insert("host".into(), host.clone());
                 rs.outputs.insert("port".into(), port.clone());
-                rs.outputs.insert("uri".into(), redis_uri(&password, &host, &port));
+                rs.outputs
+                    .insert("uri".into(), redis_uri(&password, &host, &port));
             }
             Kind::Bucket => {
                 let bucket = output_string(parsed, &format!("{}_bucket", r.name))?;
@@ -271,6 +282,161 @@ pub fn expected_backend(spec: &Project) -> Result<()> {
     Ok(())
 }
 
+/// How to resolve the applier `/32` before emitting AWS JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CidrMode {
+    /// Plan / apply / emit: always rediscover so an IP change is a plan update.
+    Rediscover,
+    /// Destroy: keep the persisted `/32` so the config stays stable offline.
+    PreferPersisted,
+}
+
+pub(crate) fn needs_engine_sg(spec: &Project) -> bool {
+    spec.resources
+        .iter()
+        .any(|r| matches!(r.kind, Kind::Postgres | Kind::Redis))
+}
+
+pub(crate) fn needs_applier_cidr(spec: &Project) -> bool {
+    spec.resources
+        .iter()
+        .any(|r| matches!(r.kind, Kind::Postgres | Kind::Redis) && r.bind == Bind::Localhost)
+}
+
+pub(crate) fn prepare_emit(spec: &Project, state: &mut State, mode: CidrMode) -> Result<()> {
+    if spec.backend != Backend::Aws || !needs_engine_sg(spec) {
+        return Ok(());
+    }
+    if !needs_applier_cidr(spec) {
+        return Ok(());
+    }
+    match mode {
+        CidrMode::Rediscover => {
+            state.applier_cidr = Some(discover_applier_cidr()?);
+        }
+        CidrMode::PreferPersisted => {
+            if state.applier_cidr.is_none() {
+                state.applier_cidr = Some(discover_applier_cidr()?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Public IPv4 of this machine as `a.b.c.d/32`. Never returns `0.0.0.0/0`.
+pub fn discover_applier_cidr() -> Result<String> {
+    #[cfg(test)]
+    if let Some(stub) = test_stub() {
+        return match stub {
+            Ok(raw) => parse_applier_cidr(&raw),
+            Err(()) => Err(Error::PublicIpv4Undetermined),
+        };
+    }
+    if let Ok(raw) = std::env::var("TOFY_APPLIER_CIDR") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return parse_applier_cidr(raw);
+        }
+    }
+    match fetch_public_ipv4() {
+        Some(ip) => parse_applier_cidr(&ip.to_string()),
+        None => Err(Error::PublicIpv4Undetermined),
+    }
+}
+
+fn parse_applier_cidr(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "0.0.0.0/0" || raw == "0.0.0.0" {
+        return Err(Error::PublicIpv4Undetermined);
+    }
+    let ip_part = if let Some(ip) = raw.strip_suffix("/32") {
+        ip
+    } else if raw.contains('/') {
+        return Err(Error::PublicIpv4Undetermined);
+    } else {
+        raw
+    };
+    let ip: Ipv4Addr = ip_part.parse().map_err(|_| Error::PublicIpv4Undetermined)?;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
+        return Err(Error::PublicIpv4Undetermined);
+    }
+    Ok(format!("{ip}/32"))
+}
+
+fn fetch_public_ipv4() -> Option<Ipv4Addr> {
+    const TARGETS: &[(&str, &str)] = &[
+        ("checkip.amazonaws.com", "/"),
+        ("icanhazip.com", "/"),
+        ("ifconfig.me", "/ip"),
+    ];
+    for (host, path) in TARGETS {
+        if let Some(ip) = http_ipv4(host, path) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+fn http_ipv4(host: &str, path: &str) -> Option<Ipv4Addr> {
+    let addr = (host, 80).to_socket_addrs().ok()?.find(|a| a.is_ipv4())?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .ok()?;
+    let req = format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: tofy\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or(&text);
+    let token = body
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(32)
+        .collect::<String>();
+    let ip: Ipv4Addr = token.parse().ok()?;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
+        return None;
+    }
+    Some(ip)
+}
+
+#[cfg(test)]
+thread_local! {
+    static IP_STUB: std::cell::RefCell<Option<std::result::Result<String, ()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn test_stub() -> Option<std::result::Result<String, ()>> {
+    IP_STUB.with(|c| c.borrow().clone())
+}
+
+#[cfg(test)]
+static DISCOVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Pin public-IP discovery for unit tests / CI. Not a product networking knob.
+#[cfg(test)]
+pub(crate) fn with_applier_cidr<T>(cidr: &str, f: impl FnOnce() -> T) -> T {
+    let _g = DISCOVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    IP_STUB.with(|c| *c.borrow_mut() = Some(Ok(cidr.to_string())));
+    let out = f();
+    IP_STUB.with(|c| *c.borrow_mut() = None);
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn with_public_ip_undetermined<T>(f: impl FnOnce() -> T) -> T {
+    let _g = DISCOVER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    IP_STUB.with(|c| *c.borrow_mut() = Some(Err(())));
+    let out = f();
+    IP_STUB.with(|c| *c.borrow_mut() = None);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,13 +447,18 @@ mod tests {
         assert_eq!(resource_id("demoaws", "appdb"), "tofy-demoaws-appdb");
         let bucket = s3_bucket_name("demoaws", "uploads", "AbC123xy");
         assert!(bucket.starts_with("tofy-demoaws-uploads-"));
-        assert!(bucket.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
         assert!(bucket.len() <= 63);
     }
 
     #[test]
     fn profile_headers_cover_config_style() {
-        assert_eq!(profile_headers("default", true), vec!["[default]".to_string()]);
+        assert_eq!(
+            profile_headers("default", true),
+            vec!["[default]".to_string()]
+        );
         assert!(profile_headers("work", true).contains(&"[profile work]".into()));
         assert!(profile_headers("work", false).contains(&"[work]".into()));
     }
@@ -310,7 +481,8 @@ mod tests {
 
         let mut spec = Project::new("demoaws");
         spec.backend = Backend::Aws;
-        spec.resources.push(Resource::new("cache", Kind::Redis).with_port(26379));
+        spec.resources
+            .push(Resource::new("cache", Kind::Redis).with_port(26379));
         let mut state = prepare_state(&spec, &State::default());
         let password = state.resources["cache"].outputs["password"].clone();
         let parsed = serde_json::json!({
@@ -325,5 +497,35 @@ mod tests {
         );
         assert!(uri.starts_with("rediss://:"), "{uri}");
         assert!(!uri.contains("redis://:"), "{uri}");
+    }
+
+    #[test]
+    fn parse_applier_cidr_is_slash32_only() {
+        assert_eq!(
+            parse_applier_cidr("203.0.113.10").unwrap(),
+            "203.0.113.10/32"
+        );
+        assert_eq!(
+            parse_applier_cidr("203.0.113.10/32").unwrap(),
+            "203.0.113.10/32"
+        );
+        assert!(parse_applier_cidr("0.0.0.0/0").is_err());
+        assert!(parse_applier_cidr("0.0.0.0").is_err());
+        assert!(parse_applier_cidr("127.0.0.1").is_err());
+        assert!(parse_applier_cidr("203.0.113.10/24").is_err());
+        assert!(parse_applier_cidr("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn discover_uses_stub_and_missing_is_an_error() {
+        with_applier_cidr("203.0.113.10/32", || {
+            assert_eq!(discover_applier_cidr().unwrap(), "203.0.113.10/32");
+        });
+        with_public_ip_undetermined(|| {
+            assert!(matches!(
+                discover_applier_cidr(),
+                Err(Error::PublicIpv4Undetermined)
+            ));
+        });
     }
 }

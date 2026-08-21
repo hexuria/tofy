@@ -55,7 +55,7 @@ No AWS, no new kinds, no PgPool.
 - Honest `tofy plan` on `Backend::Tofu`: run the OpenTofu engine plan against the emitted 0600 `.tofy/main.tf.json` (init if needed). Print that plan. Redact secrets. Missing tofu errors and does not print `No changes.` as if it planned. Plan does not mark resources Applied. Local plan stays the live-refresh planner — do not replace it with tofu.
 - `examples/infra-tofu` is `stack("demotofu")` with host ports 15433 / 16379 / 19000 so it can coexist with `examples/infra` (`demo` / 5433 / 6379 / 9000). Containers are `tofy-demotofu-*`. Same three resources and `.backend(Backend::Tofu)`.
 
-## This PR — AWS backend
+## This PR — AWS backend (merged)
 
 `Backend::Aws` is a real OpenTofu AWS-provider engine. Same postgres / redis / bucket lines. No VPC, RDS, or IAM methods on the builders.
 
@@ -76,6 +76,17 @@ No AWS, no new kinds, no PgPool.
 - Secrets generated once (postgres / redis passwords) and persisted in `.tofy/state.json`. After apply, hosts come from OpenTofu outputs. Redis URI is `rediss://` because ElastiCache is created with transit encryption + AUTH. S3 is IAM-less: bucket name + region + endpoint (no minted access keys). Plan redacts secrets.
 - Required CI job: unit tests, emit `examples/infra-aws`, `tofu init` + `tofu validate`, prove missing-creds apply / plan do not claim Applied / `No changes.`. Does **not** live-apply AWS. Local and tofu-docker smokes stay required and unchanged.
 - `examples/infra-aws` is `stack("demoaws")` with ports 25432 / 26379 so it does not collide with `demo` or `demotofu`.
+
+## This PR — AWS laptop reach (RDS) + honest Redis
+
+`tofy run` on the applying machine must be able to use the postgres host URI. The account default security group does not admit a laptop, and `publicly_accessible` only on `Bind::All` was the wrong meaning of Localhost. ElastiCache has no public IP, so Redis is not laptop-reachable; the same SG still attaches for in-VPC / VPN clients. Redis URIs stay `rediss://` (transit encryption + AUTH).
+
+- At plan / apply / emit, discover the applying machine's public IPv4 (`checkip.amazonaws.com` and fallbacks, or `TOFY_APPLIER_CIDR`). If it cannot be determined, error. Do not fall back to `0.0.0.0/0`.
+- Emit a tofy-owned security group in the account default VPC (not a user macro; no `.vpc()` / `.securityGroup()` / `.cidr()` / `.publiclyAccessible()`). Ingress: postgres and/or redis from that `/32` for `Bind::Localhost`. Egress as needed for the engines. Attach it to RDS and ElastiCache instead of the account default SG.
+- `Bind::Localhost` means "not the whole internet" (applier `/32` only), not bind `127.0.0.1` on AWS. RDS `publicly_accessible` is set so the postgres host URI is routable from that machine. ElastiCache remains VPC-only. `Bind::All` opens ingress to `0.0.0.0/0`; the default example stays Localhost.
+- Persist the `/32` in `.tofy/state.json` so destroy/plan stay stable. If the IP changed, plan shows an SG-rule update.
+- Unit tests: tofy SG + `/32`, not `0.0.0.0/0` for Localhost; no `aws_vpc` resource; default-VPC data source stays; S3 unchanged; missing public-IP detection errors; Redis URI is `rediss://`.
+- `scripts/ci-smoke-aws.sh` still `tofu validate` only (stub the `/32`); assert ingress is a `/32`; missing-creds still must not claim Applied. Local and tofu-docker smokes stay required.
 
 ## Later
 

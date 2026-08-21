@@ -11,6 +11,8 @@ ROOT="${TOFY_SMOKE_DIR:-examples/infra-aws}"
 PKG="${TOFY_SMOKE_PKG:-infra-aws}"
 BIN=(cargo run -q -p tofy -- --dir "$ROOT")
 export TOFY_SMOKE_ROOT="$ROOT"
+# Deterministic applier /32 for emit + validate. Not a live AWS allowlist.
+export TOFY_APPLIER_CIDR="${TOFY_APPLIER_CIDR:-203.0.113.10/32}"
 
 if ! command -v tofu >/dev/null 2>&1; then
   echo "OpenTofu engine is required for this backend; refusing to treat emit-only as success."
@@ -87,7 +89,35 @@ if first.get("instance_class") != "db.t4g.micro":
     sys.exit(f"small postgres must map to db.t4g.micro, got {first.get('instance_class')}")
 if first.get("multi_az") is True:
     sys.exit("must not enable Multi-AZ")
-print("emit wrote AWS OpenTofu JSON mode 0600; default-VPC data; no docker/VPC/IAM resources")
+if first.get("publicly_accessible") is not True:
+    sys.exit("postgres must be publicly reachable so the host URI works from the applier")
+sgs = first.get("vpc_security_group_ids") or []
+if not any("aws_security_group.tofy" in str(s) for s in sgs):
+    sys.exit(f"postgres must attach the tofy SG, got {sgs}")
+if any("aws_security_group.default" in str(s) for s in sgs):
+    sys.exit("must not attach only the account default SG")
+if "aws_security_group" not in resource:
+    sys.exit("AWS backend must emit a tofy-owned aws_security_group")
+sg = (resource.get("aws_security_group") or {}).get("tofy") or {}
+if not sg:
+    sys.exit("aws_security_group.tofy is missing")
+if "data.aws_vpc.default" not in str(sg.get("vpc_id")):
+    sys.exit("tofy SG must live in the account default VPC")
+ingress = resource.get("aws_vpc_security_group_ingress_rule") or {}
+if not ingress:
+    sys.exit("AWS backend must emit SG ingress rules")
+for name, rule in ingress.items():
+    cidr = rule.get("cidr_ipv4") or ""
+    if cidr == "0.0.0.0/0":
+        sys.exit(f"Localhost ingress for {name} must not be 0.0.0.0/0")
+    if not str(cidr).endswith("/32"):
+        sys.exit(f"Localhost ingress for {name} must be a /32, got {cidr!r}")
+cache = resource.get("aws_elasticache_replication_group") or {}
+cfirst = next(iter(cache.values()))
+csgs = cfirst.get("security_group_ids") or []
+if not any("aws_security_group.tofy" in str(s) for s in csgs):
+    sys.exit(f"redis must attach the tofy SG, got {csgs}")
+print("emit wrote AWS OpenTofu JSON mode 0600; default-VPC data; tofy SG /32; no docker/VPC/IAM resources")
 PY
 
 echo "== tofu init + validate (no AWS credentials, no apply) =="
