@@ -153,6 +153,15 @@ fn refresh_outputs(
     let parsed: Value = serde_json::from_str(raw.trim()).map_err(|e| {
         Error::Engine(format!("OpenTofu engine output was not JSON: {e}"))
     })?;
+    merge_engine_outputs(&parsed, spec, state)
+}
+
+/// ElastiCache is emitted with transit encryption and AUTH. Clients must use TLS.
+pub fn redis_uri(password: &str, host: &str, port: impl std::fmt::Display) -> String {
+    format!("rediss://:{password}@{host}:{port}")
+}
+
+fn merge_engine_outputs(parsed: &Value, spec: &Project, state: &mut State) -> Result<()> {
     for r in &spec.resources {
         let rs = state
             .resources
@@ -160,8 +169,8 @@ fn refresh_outputs(
             .ok_or_else(|| Error::Engine(format!("missing prepared state for {}", r.name)))?;
         match r.kind {
             Kind::Postgres => {
-                let host = output_string(&parsed, &format!("{}_host", r.name))?;
-                let port = output_string(&parsed, &format!("{}_port", r.name))
+                let host = output_string(parsed, &format!("{}_host", r.name))?;
+                let port = output_string(parsed, &format!("{}_port", r.name))
                     .unwrap_or_else(|_| rs.port.to_string());
                 let user = rs.outputs.get("user").cloned().unwrap_or_else(|| "tofy".into());
                 let password = rs.outputs.get("password").cloned().unwrap_or_default();
@@ -179,22 +188,19 @@ fn refresh_outputs(
                 );
             }
             Kind::Redis => {
-                let host = output_string(&parsed, &format!("{}_host", r.name))?;
-                let port = output_string(&parsed, &format!("{}_port", r.name))
+                let host = output_string(parsed, &format!("{}_host", r.name))?;
+                let port = output_string(parsed, &format!("{}_port", r.name))
                     .unwrap_or_else(|_| rs.port.to_string());
                 let password = rs.outputs.get("password").cloned().unwrap_or_default();
                 rs.port = port.parse().unwrap_or(rs.port);
                 rs.outputs.insert("host".into(), host.clone());
                 rs.outputs.insert("port".into(), port.clone());
-                rs.outputs.insert(
-                    "uri".into(),
-                    format!("redis://:{password}@{host}:{port}"),
-                );
+                rs.outputs.insert("uri".into(), redis_uri(&password, &host, &port));
             }
             Kind::Bucket => {
-                let bucket = output_string(&parsed, &format!("{}_bucket", r.name))?;
-                let region = output_string(&parsed, &format!("{}_region", r.name))?;
-                let endpoint = output_string(&parsed, &format!("{}_endpoint", r.name))?;
+                let bucket = output_string(parsed, &format!("{}_bucket", r.name))?;
+                let region = output_string(parsed, &format!("{}_region", r.name))?;
+                let endpoint = output_string(parsed, &format!("{}_endpoint", r.name))?;
                 rs.outputs.insert("bucket".into(), bucket);
                 rs.outputs.insert("region".into(), region);
                 rs.outputs.insert("endpoint".into(), endpoint);
@@ -203,7 +209,6 @@ fn refresh_outputs(
             }
         }
     }
-    let _ = spec.backend;
     Ok(())
 }
 
@@ -285,5 +290,40 @@ mod tests {
         assert_eq!(profile_headers("default", true), vec!["[default]".to_string()]);
         assert!(profile_headers("work", true).contains(&"[profile work]".into()));
         assert!(profile_headers("work", false).contains(&"[work]".into()));
+    }
+
+    #[test]
+    fn redis_uri_is_tls_because_elasticache_enables_transit_encryption() {
+        let uri = redis_uri("s3cretValue", "cache.example.cache.amazonaws.com", 6379);
+        assert!(uri.starts_with("rediss://:"), "{uri}");
+        assert!(!uri.starts_with("redis://:"), "{uri}");
+        assert_eq!(
+            uri,
+            "rediss://:s3cretValue@cache.example.cache.amazonaws.com:6379"
+        );
+    }
+
+    #[test]
+    fn merge_engine_outputs_writes_rediss_uri() {
+        use crate::state::prepare_state;
+        use tofy_spec::{Kind, Project, Resource};
+
+        let mut spec = Project::new("demoaws");
+        spec.backend = Backend::Aws;
+        spec.resources.push(Resource::new("cache", Kind::Redis).with_port(26379));
+        let mut state = prepare_state(&spec, &State::default());
+        let password = state.resources["cache"].outputs["password"].clone();
+        let parsed = serde_json::json!({
+            "cache_host": { "value": "master.demoaws.cache.amazonaws.com" },
+            "cache_port": { "value": 26379 }
+        });
+        merge_engine_outputs(&parsed, &spec, &mut state).unwrap();
+        let uri = &state.resources["cache"].outputs["uri"];
+        assert_eq!(
+            uri,
+            &format!("rediss://:{password}@master.demoaws.cache.amazonaws.com:26379")
+        );
+        assert!(uri.starts_with("rediss://:"), "{uri}");
+        assert!(!uri.contains("redis://:"), "{uri}");
     }
 }

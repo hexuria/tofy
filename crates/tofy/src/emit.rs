@@ -671,6 +671,15 @@ mod tests {
             tf["resource"]["aws_elasticache_replication_group"]["cache"]["multi_az_enabled"],
             false
         );
+        assert_eq!(
+            tf["resource"]["aws_elasticache_replication_group"]["cache"]["transit_encryption_enabled"],
+            true
+        );
+        let password = state.resources["cache"].outputs["password"].as_str();
+        assert_eq!(
+            tf["resource"]["aws_elasticache_replication_group"]["cache"]["auth_token"],
+            password
+        );
         let bucket = tf["resource"]["aws_s3_bucket"]["uploads"]["bucket"]
             .as_str()
             .unwrap();

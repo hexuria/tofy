@@ -92,7 +92,7 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 | --- | --- |
 | stack | `TOFY_NETWORK` (`tofy-demo`) |
 | `appdb` (postgres) | `TOFY_APPDB_URI`, `TOFY_APPDB_PASSWORD`, `TOFY_APPDB_USER`, `TOFY_APPDB_DATABASE`, `TOFY_APPDB_PORT`, `TOFY_APPDB_HOST`, plus `TOFY_APPDB_INTERNAL_*` |
-| `cache` (redis) | `TOFY_CACHE_URI` (`redis://:<password>@127.0.0.1:…`), `TOFY_CACHE_PASSWORD`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*` |
+| `cache` (redis) | Local / Tofu: `TOFY_CACHE_URI` (`redis://:<password>@127.0.0.1:…`), `TOFY_CACHE_PASSWORD`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*`. Aws: `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS; ElastiCache AUTH) |
 | `uploads` (bucket) | Local / Tofu: `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*`. Aws: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT` (no minted keys) |
 
 **Host vs in-stack.** `tofy run` and processes on the laptop use loopback (`TOFY_APPDB_URI=postgres://…@127.0.0.1:5433/…`). Another container on the private network uses the resource DNS name and the container port (`TOFY_APPDB_INTERNAL_URI=postgres://…@appdb:5432/…`).

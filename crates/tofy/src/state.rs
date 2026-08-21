@@ -278,7 +278,7 @@ fn aws_outputs_for(
             if !host.is_empty() {
                 out.insert(
                     "uri".into(),
-                    format!("redis://:{password}@{host}:{port}"),
+                    crate::aws::redis_uri(&password, &host, port),
                 );
                 out.insert("host".into(), host);
             }
@@ -425,6 +425,21 @@ mod tests {
         let cache = &first.resources["cache"].outputs;
         assert_eq!(cache["password"].len(), 32);
         assert!(!cache.contains_key("uri"));
+        let mut with_host = first.clone();
+        with_host.resources.get_mut("cache").unwrap().outputs.insert(
+            "host".into(),
+            "master.demoaws.cache.amazonaws.com".into(),
+        );
+        let after_host = prepare_state(&spec, &with_host);
+        let cache_uri = &after_host.resources["cache"].outputs["uri"];
+        let pass = &after_host.resources["cache"].outputs["password"];
+        assert!(cache_uri.starts_with("rediss://:"), "{cache_uri}");
+        assert!(!cache_uri.starts_with("redis://:"), "{cache_uri}");
+        assert_eq!(
+            cache_uri,
+            &format!("rediss://:{pass}@master.demoaws.cache.amazonaws.com:6379")
+        );
+        assert_eq!(pass, &first.resources["cache"].outputs["password"]);
         let files = &first.resources["uploads"].outputs;
         assert!(files["bucket"].starts_with("tofy-demoaws-uploads-"), "{files:?}");
         assert!(!files.contains_key("access_key"), "{files:?}");
