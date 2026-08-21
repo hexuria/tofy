@@ -1,8 +1,8 @@
 # tofy
 
-A Rust control language for infrastructure. You write declarations with macros and builders. Those emit a language-agnostic resource spec (JSON IR). The engine plans and applies that spec the way OpenTofu plans and applies Terraform: diff against state, create / update / delete, write outputs.
+A Rust control language for infrastructure. You write typestate builders and `#[tofy::main]`. That is the source. Those emit a language-agnostic JSON resource spec. `apply` consumes the spec: plan against state, create / update / delete, write outputs.
 
-Phase 1 applies locally with Docker. Phase 2 is a real OpenTofu backend. The Rust file is what humans write. The JSON is what the engine consumes. A Node or Go app never imports tofy; it reads env vars or `.tofy/outputs.json`.
+A Node, Go, or other app does not import tofy. It reads `TOFY_*` environment variables (or `.tofy/outputs.json`). There is no yaml happy path.
 
 ```rust
 use tofy::prelude::*;
@@ -12,28 +12,42 @@ fn main() {
     let db = postgres("appdb")
         .version("16")
         .port(5433)
-        .size(Size::Small);
-    let cache = redis("cache");
+        .size(Size::Small)
+        .bind(Bind::Localhost);
+    let cache = redis("cache").replicas(1);
     let files = bucket("uploads");
     stack("demo").add(db).add(cache).add(files).apply();
 }
 ```
 
-`postgres()` returns a declaration, not a live connection. Builders are typestate: `postgres` has no `.replicas()`, `stack("demo")` has no `.apply()` until you `.add` a resource, and after `.apply()` you cannot `.add` again. `.apply()` on the stack is apply (`cargo run` in the infra crate).
+`postgres()` is a declaration, not a live connection. Builders are `Foo<S>` with `PhantomData` — illegal methods do not exist on that impl. `stack("demo")` cannot `apply` until you `add` a resource. After `apply()` you cannot `add` again. See [docs/api.md](docs/api.md).
 
-Each stack gets a private Docker network (`tofy-demo` here). Resources resolve each other by name (`appdb`, `cache`, `uploads`). You do not declare a network. Published ports default to `127.0.0.1`; use `.bind(Bind::All)` for `0.0.0.0`.
+`.apply()` on the stack is apply. `cargo run -p infra` is apply.
+
+## What apply does
+
+1. Plans the declared stack against `.tofy/state.json`.
+2. Creates a private Docker network for the stack. Resources resolve each other by name (`appdb`, `cache`, `uploads`).
+3. Generates secrets once (passwords, object-store keys) and persists them in state. They are never re-derived as `tofy-{project}-{name}`.
+4. Starts containers with Docker. Published ports default to `127.0.0.1`. After Postgres starts, apply waits until it accepts connections.
+5. Writes `.tofy/outputs.env` and `.tofy/outputs.json`. Host consumers (`tofy run` on the laptop) get `127.0.0.1` URIs. Sibling containers on the stack network use `INTERNAL_*` keys (`postgres://…@appdb:5432/…`).
+6. `tofy run -- <cmd>` injects those env vars and execs. Apps do not depend on dotenv.
+
+If Docker is missing: artifacts are emitted, the process exits non-zero, and apply does **not** claim Applied.
+
+OpenTofu is the phase 2 **engine**, not a command you run yourself. Phase 1 does not print “go run `tofu apply`.”
 
 ## Commands
 
 ```bash
 cargo install --path crates/tofy
 
-# from the crate that calls stack():
-cargo run                  # apply
-cargo run -- plan
-cargo run -- destroy
+# public path — cargo run in the infra crate is apply
+cargo run -p infra -- --dir examples/infra
+cargo run -p infra -- --dir examples/infra plan
+cargo run -p infra -- --dir examples/infra destroy
 
-# or the CLI, pointed at that crate:
+# CLI pointed at that crate
 tofy --dir examples/infra plan
 tofy --dir examples/infra apply
 tofy --dir examples/infra output
@@ -41,15 +55,15 @@ tofy --dir examples/infra run -- node app.js
 tofy --dir examples/infra emit
 tofy --dir examples/infra destroy
 
-# apply an already-emitted spec (no Rust on that machine)
+# apply an already-emitted spec JSON (no Rust on that machine)
 tofy --dir . apply --spec spec.json
 ```
 
-`tofy plan` redacts passwords. `tofy output` prints non-secret keys; `--json` dumps everything from the local outputs file. `tofy run -- <cmd>` injects those env vars and execs — apps do not depend on dotenv.
+`tofy plan` redacts passwords. `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state (keeps emitted `main.tf.json` if you emitted it).
 
 ## Env vars
 
-After apply, `.tofy/outputs.env` and `.tofy/outputs.json` use `TOFY_<RESOURCE>_<KEY>`:
+After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 
 | Resource | Keys |
 | --- | --- |
@@ -58,11 +72,13 @@ After apply, `.tofy/outputs.env` and `.tofy/outputs.json` use `TOFY_<RESOURCE>_<
 | `cache` (redis) | `TOFY_CACHE_URI`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*` |
 | `uploads` (bucket) | `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*` |
 
-`tofy run` on the host uses loopback URIs (`postgres://…@127.0.0.1:5433/…`). A sibling container on the stack network uses the DNS name and the container port (`postgres://…@appdb:5432/…`) from the `INTERNAL_*` keys.
+**Host vs in-stack.** `tofy run` and processes on the laptop use loopback (`TOFY_APPDB_URI=postgres://…@127.0.0.1:5433/…`). Another container on the private network uses the resource DNS name and the container port (`TOFY_APPDB_INTERNAL_URI=postgres://…@appdb:5432/…`).
 
-## Size and replicas
+`.tofy/` is gitignored. Do not commit `state.json`, `outputs.env`, or secrets.
 
-`.size(Size::Small | Medium | Large)` is an attribute, not a new resource type. Local Docker maps it to memory/CPU. A later OpenTofu backend maps the same token to instance class.
+## Size, replicas, bind
+
+Attributes, not new resource types. Language stays `postgres`, `redis`, `bucket`.
 
 | size | local Docker | later OpenTofu instance class |
 | --- | --- | --- |
@@ -70,31 +86,31 @@ After apply, `.tofy/outputs.env` and `.tofy/outputs.json` use `TOFY_<RESOURCE>_<
 | `medium` | 512MiB, 0.50 CPU | `medium` |
 | `large` | 1GiB, 1.00 CPU | `large` |
 
-`.replicas(n)` is allowed on `redis` and `bucket`. Local postgres stays at 1; `replicas > 1` fails with `local backend has no HA`. Plan treats size, replica, and bind changes as updates. Extra local replicas share the resource DNS name; only replica 1 is published to the host.
+`.replicas(n)` exists on `redis` and `bucket` only. Local postgres stays at 1; `replicas > 1` errors with `local backend has no HA`. Plan treats size, replica, and bind changes as updates.
 
-Secrets (passwords, keys, URIs that embed them) are generated once, stored in `.tofy/state.json` (mode `0600`), and reused on the next apply. They are never re-derived as `tofy-{project}-{name}`.
+`.bind(Bind::Localhost)` (default) or `.bind(Bind::All)` (`0.0.0.0`) is who can reach the **published** port. In-stack traffic still uses the private network.
 
-`.tofy/` is gitignored. Do not commit `state.json` or `outputs.env`.
+**Out of scope (real Terraform / OpenTofu):** VPCs, subnets, security groups, load balancers, IAM.
 
 ## CI
 
-GitHub Actions (`ubuntu-latest` + Docker) runs `cargo test`, then really applies `examples/infra`: containers up, Postgres and Redis accept connections, `tofy run` sees `TOFY_APPDB_URI`, destroy removes the stack. If Docker is missing the job **fails**. It does not skip.
+Required Docker provision on GitHub-hosted `ubuntu-latest`. Docker is not disabled.
+
+1. `cargo test --workspace`
+2. `cargo run -p infra -- --dir examples/infra apply` — must exit 0, state `applied`
+3. Health checks: containers running, Postgres accepts connections, Redis PING
+4. `tofy run` can read `TOFY_APPDB_URI`
+5. `tofy destroy` and containers are gone
+
+If Docker is missing, the job **fails**. It does not skip. It does not treat “emitted compose, exit 1” as success.
 
 ## What this is not
 
 **Not Shuttle.** Shuttle's macros provision on Shuttle's cloud. tofy declarations are desired state. You apply them on your machine (Docker today, OpenTofu later). The process that runs your app only reads env.
 
-**Not Compose.** Compose is a container file format. tofy is a control language plus a planner. The local backend may start containers with Docker, and it may write a compose file as an artifact, but you do not write that file and you do not treat tofy as `docker compose` with extra steps.
+**Not Compose.** Compose is a container file format. tofy is a control language plus a planner. The local backend may start containers with Docker and may write a compose file as an artifact. You do not write that file, and tofy is not `docker compose` with extra steps.
 
-**Not just OpenTofu.** OpenTofu is a later backend (see [PLAN.md](PLAN.md)). The product is the Rust frontend and the IR. Phase 1 does not shell out to `tofu apply`.
-
-## Language
-
-Small on purpose: `postgres`, `redis`, `bucket`. App-adjacent resources only.
-
-**Out of scope (use real Terraform / OpenTofu):** VPCs, subnets, security groups, load balancers, IAM. This language does not grow those types. The private Docker network is for in-stack DNS, not a VPC.
-
-YAML is an importer to the same IR (`tofy apply --spec tofy.yaml`), not the happy path.
+**Not just OpenTofu.** OpenTofu is a later backend ([PLAN.md](PLAN.md) phase 2). The product is the Rust frontend and the IR. You do not run `tofu apply` yourself in phase 1.
 
 ## Repo
 
