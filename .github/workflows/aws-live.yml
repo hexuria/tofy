@@ -1,0 +1,61 @@
+# Required CI stays .github/workflows/ci.yml job "test and aws validate"
+# (emit + tofu validate only). This workflow is opt-in live apply.
+name: aws-live
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-aws-apply:
+    name: live aws apply (optional)
+    if: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || secrets.AWS_REGION || 'us-east-1' }}
+      TOFY_AWS_LIVE_OPTIONAL: "1"
+      TOFY_AWS_LIVE_SUFFIX: ${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.83.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-aws-live-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-aws-live-
+            ${{ runner.os }}-cargo-aws-
+            ${{ runner.os }}-cargo-
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Require OpenTofu
+        run: tofu version
+
+      - name: Install probe clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          command -v aws || sudo apt-get install -y awscli
+
+      - name: Live apply, probe, and destroy
+        run: bash scripts/ci-smoke-aws-live.sh
