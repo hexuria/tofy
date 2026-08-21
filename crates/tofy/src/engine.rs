@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tofy_spec::{Kind, Project};
+use tofy_spec::{Backend, Kind, Project};
 
 use crate::docker;
 use crate::emit;
@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::lock::Lock;
 use crate::outputs;
 use crate::state::{self, prepare_state, State};
+use crate::tofu;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -119,13 +120,42 @@ pub fn apply(root: &Path, spec: &Project) -> Result<String> {
     let mut next = prepare_state(spec, &current);
     emit::write_artifacts(root, spec, &next)?;
 
+    match spec.backend {
+        Backend::Local => apply_local(root, spec, &current, &actions, &mut next),
+        Backend::Tofu => apply_tofu(root, spec, &actions, &mut next),
+    }
+}
+
+fn applied_message(actions: &[Action]) -> String {
+    let mut msg = format_actions(actions);
+    msg.push('\n');
+    msg.push_str("Applied. Outputs written to .tofy/outputs.env\n");
+    msg
+}
+
+fn emit_without_engine(
+    root: &Path,
+    actions: &[Action],
+    next: &mut State,
+    err: Error,
+) -> Result<String> {
+    state::mark_emitted(next);
+    next.save(root)?;
+    outputs::write(root, next)?;
+    print!("{}", format_actions(actions));
+    println!();
+    Err(err)
+}
+
+fn apply_local(
+    root: &Path,
+    spec: &Project,
+    current: &State,
+    actions: &[Action],
+    next: &mut State,
+) -> Result<String> {
     if !docker::available() {
-        state::mark_emitted(&mut next);
-        next.save(root)?;
-        outputs::write(root, &next)?;
-        print!("{}", format_actions(&actions));
-        println!();
-        return Err(Error::DockerMissing);
+        return emit_without_engine(root, actions, next, Error::DockerMissing);
     }
 
     if spec.resources.is_empty() {
@@ -135,7 +165,7 @@ pub fn apply(root: &Path, spec: &Project) -> Result<String> {
     }
 
     // Deletes first so ports can be reused.
-    for a in &actions {
+    for a in actions {
         if let Action::Delete { name, .. } = a {
             let n = current.resources.get(name).map(|r| r.replicas).unwrap_or(1);
             docker::destroy_resource(&current.project, name, n)?;
@@ -164,14 +194,32 @@ pub fn apply(root: &Path, spec: &Project) -> Result<String> {
         }
     }
 
-    state::mark_applied(&mut next);
+    state::mark_applied(next);
     next.save(root)?;
-    outputs::write(root, &next)?;
+    outputs::write(root, next)?;
+    Ok(applied_message(actions))
+}
 
-    let mut msg = format_actions(&actions);
-    msg.push('\n');
-    msg.push_str("Applied. Outputs written to .tofy/outputs.env\n");
-    Ok(msg)
+fn apply_tofu(root: &Path, spec: &Project, actions: &[Action], next: &mut State) -> Result<String> {
+    emit::write_tofu_config(root, spec, next)?;
+    if !tofu::available() {
+        return emit_without_engine(root, actions, next, Error::TofuMissing);
+    }
+    if !docker::available() {
+        return emit_without_engine(root, actions, next, Error::DockerMissing);
+    }
+
+    // Persist secrets and backend before the engine runs so a failed apply
+    // is not Applied and destroy still knows this stack uses OpenTofu.
+    state::mark_emitted(next);
+    next.save(root)?;
+
+    tofu::apply(root, spec, next)?;
+
+    state::mark_applied(next);
+    next.save(root)?;
+    outputs::write(root, next)?;
+    Ok(applied_message(actions))
 }
 
 pub fn destroy(root: &Path) -> Result<String> {
@@ -181,6 +229,13 @@ pub fn destroy(root: &Path) -> Result<String> {
         outputs::clear(root)?;
         return Ok("Nothing in state.\n".into());
     }
+    match current.backend {
+        Backend::Local => destroy_local(root, &mut current),
+        Backend::Tofu => destroy_tofu(root, &mut current),
+    }
+}
+
+fn destroy_local(root: &Path, current: &mut State) -> Result<String> {
     if !docker::available() {
         return Err(Error::DestroyNeedsDocker);
     }
@@ -193,6 +248,20 @@ pub fn destroy(root: &Path) -> Result<String> {
     current.save(root)?;
     outputs::clear(root)?;
     Ok("Destroyed local resources and cleared state.\n".into())
+}
+
+fn destroy_tofu(root: &Path, current: &mut State) -> Result<String> {
+    if !tofu::available() {
+        return Err(Error::DestroyNeedsTofu);
+    }
+    if !docker::available() {
+        return Err(Error::DestroyNeedsDocker);
+    }
+    tofu::destroy(root, current)?;
+    current.clear_resources();
+    current.save(root)?;
+    outputs::clear(root)?;
+    Ok("Destroyed resources and cleared state.\n".into())
 }
 
 pub fn emit(root: &Path, spec: &Project) -> Result<String> {
@@ -389,5 +458,82 @@ mod tests {
         let after = std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
         assert_eq!(before, after);
         assert!(dir.path().join(".tofy").join("outputs.env").exists());
+    }
+
+    fn tofu_spec(resources: &[(&str, Kind, Option<u16>)]) -> Project {
+        let mut p = spec(resources);
+        p.backend = Backend::Tofu;
+        p
+    }
+
+    #[test]
+    fn apply_without_tofu_emits_and_errors() {
+        if tofu::available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = tofu_spec(&[
+            ("appdb", Kind::Postgres, Some(5433)),
+            ("cache", Kind::Redis, None),
+            ("uploads", Kind::Bucket, None),
+        ]);
+        let err = apply(dir.path(), &spec).unwrap_err();
+        assert!(matches!(err, Error::TofuMissing), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("OpenTofu engine is required"), "{msg}");
+        assert!(!msg.contains("Applied"));
+        assert!(!msg.to_lowercase().contains("go run"));
+        assert!(!msg.contains("tofu apply"));
+        assert!(dir.path().join(".tofy").join("spec.json").exists());
+        assert!(dir.path().join(".tofy").join("main.tf.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(".tofy").join("main.tf.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let loaded = State::load(dir.path()).unwrap();
+        assert_eq!(loaded.backend, Backend::Tofu);
+        assert!(loaded
+            .resources
+            .values()
+            .all(|r| r.status != crate::state::Status::Applied));
+    }
+
+    #[test]
+    fn destroy_without_tofu_leaves_state() {
+        if tofu::available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = tofu_spec(&[("cache", Kind::Redis, None)]);
+        let state = prepare_state(&spec, &State::default());
+        assert_eq!(state.backend, Backend::Tofu);
+        state.save(dir.path()).unwrap();
+        outputs::write(dir.path(), &state).unwrap();
+        let before = std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
+        let err = destroy(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::DestroyNeedsTofu), "{err}");
+        assert!(err.to_string().contains("OpenTofu engine is required"));
+        assert!(!err.to_string().contains("Destroyed"));
+        assert!(!err.to_string().to_lowercase().contains("go run"));
+        let after = std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
+        assert_eq!(before, after);
+        assert!(dir.path().join(".tofy").join("outputs.env").exists());
+    }
+
+    #[test]
+    fn local_apply_still_skips_tofu_config() {
+        if docker::available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let _ = apply(dir.path(), &spec);
+        assert!(!dir.path().join(".tofy").join("main.tf.json").exists());
     }
 }

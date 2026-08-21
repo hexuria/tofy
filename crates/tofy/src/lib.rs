@@ -16,5 +16,6 @@ pub mod prelude;
 pub mod rt;
 pub mod s3;
 pub mod state;
+pub mod tofu;
 
 pub use error::{Error, Result};

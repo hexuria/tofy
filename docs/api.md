@@ -2,7 +2,7 @@
 
 The written source is Rust. Builders are typestate: every builder is `Foo<S>` with `_state: PhantomData<S>` and a zero-sized state type. Methods that are illegal in a state **do not exist** on that impl (not `#[deprecated]`, not a runtime error).
 
-`use tofy::prelude::*;` exports `postgres`, `redis`, `bucket`, `stack`, `Size`, `Bind`, and the `main` macro. `#[tofy::main]` still wraps `fn main`.
+`use tofy::prelude::*;` exports `postgres`, `redis`, `bucket`, `stack`, `Size`, `Bind`, `Backend`, and the `main` macro. `#[tofy::main]` still wraps `fn main`.
 
 ## Resource builders
 
@@ -31,9 +31,11 @@ The local backend has no HA. `replicas` is not a method on any Open builder. If 
 
 | State | Methods | Not on this state |
 | --- | --- | --- |
-| `Stack<Empty>` | `add(resource) -> Stack<NonEmpty>` | `plan`, `apply`, `output`, `run` |
-| `Stack<NonEmpty>` | `add -> Stack<NonEmpty>`, `plan(self)`, `apply(self) -> Stack<Applied>` | `output`, `run` |
+| `Stack<Empty>` | `backend(Backend)`, `tofu()`, `add(resource) -> Stack<NonEmpty>` | `plan`, `apply`, `output`, `run` |
+| `Stack<NonEmpty>` | `add -> Stack<NonEmpty>`, `plan(self)`, `apply(self) -> Stack<Applied>` | `output`, `run`, `backend` |
 | `Stack<Applied>` | `output`, `run` | `add`, a second `apply` that mutates the graph |
+
+`.backend(Backend::Tofu)` (or `.tofu()`) is legal only on `Stack<Empty>`. Default is `Backend::Local`. `tofy apply` applies whichever backend the declared spec already has.
 
 `.apply()` on `Stack<NonEmpty>` calls `engine::apply` and only then returns `Stack<Applied>`. `cargo run -p infra` with no verb still applies.
 
@@ -62,4 +64,6 @@ After apply, other languages **do not** import tofy.
 
 `TOFY_APPDB_URI` is the host loopback URI for the laptop. A sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`). Redis is the same shape with a password: `TOFY_CACHE_URI` is `redis://:<password>@127.0.0.1:…` and `TOFY_CACHE_PASSWORD` is the secret.
 
-The JSON IR (`Project` / `Resource` / `Kind` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
+The JSON IR (`Project` / `Resource` / `Kind` / `Backend` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
+
+When `backend` is `tofu`, apply runs the OpenTofu engine against an emitted docker-provider config under `.tofy/` (mode `0600` if it contains secrets). The user-facing command is still `tofy apply`, not `tofu`.

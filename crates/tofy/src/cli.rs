@@ -46,7 +46,7 @@ pub enum Cmd {
         #[arg(last = true, required = true)]
         args: Vec<String>,
     },
-    /// Write spec JSON and OpenTofu JSON without applying
+    /// Write spec JSON without applying
     Emit,
 }
 

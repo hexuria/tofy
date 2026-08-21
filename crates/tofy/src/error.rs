@@ -12,6 +12,12 @@ pub enum Error {
     DockerMissing,
     #[error("Docker is not available; did not destroy. State left unchanged.")]
     DestroyNeedsDocker,
+    #[error("OpenTofu engine is required for this backend; did not apply.")]
+    TofuMissing,
+    #[error(
+        "OpenTofu engine is required for this backend; did not destroy. State left unchanged."
+    )]
+    DestroyNeedsTofu,
     #[error("another tofy apply or destroy is already running in this directory")]
     Locked,
     #[error("{0}")]

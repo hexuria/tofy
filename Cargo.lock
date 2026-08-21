@@ -243,6 +243,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "infra-tofu"
+version = "0.1.0"
+dependencies = [
+ "tofy",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

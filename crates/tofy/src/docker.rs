@@ -238,7 +238,7 @@ pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Resul
     Ok(())
 }
 
-fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<()> {
+pub fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<()> {
     match r.kind {
         Kind::Postgres => wait_for_postgres(container, rs.port),
         Kind::Redis => {

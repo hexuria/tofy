@@ -14,3 +14,8 @@
 **/.tofy/outputs.env
 **/.tofy/outputs.json
 **/.tofy/lock
+**/.tofy/main.tf.json
+**/.tofy/terraform.tfstate
+**/.tofy/terraform.tfstate.backup
+**/.tofy/.terraform.lock.hcl
+**/.tofy/.terraform/
