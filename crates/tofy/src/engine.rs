@@ -181,13 +181,14 @@ pub fn destroy(root: &Path) -> Result<String> {
         outputs::clear(root)?;
         return Ok("Nothing in state.\n".into());
     }
-    if docker::available() {
-        let project = current.project.clone();
-        for (name, rs) in &current.resources {
-            docker::destroy_resource(&project, name, rs.replicas)?;
-        }
-        docker::destroy_network(&project)?;
+    if !docker::available() {
+        return Err(Error::DestroyNeedsDocker);
     }
+    let project = current.project.clone();
+    for (name, rs) in &current.resources {
+        docker::destroy_resource(&project, name, rs.replicas)?;
+    }
+    docker::destroy_network(&project)?;
     current.clear_resources();
     current.save(root)?;
     outputs::clear(root)?;
@@ -199,7 +200,7 @@ pub fn emit(root: &Path, spec: &Project) -> Result<String> {
     let current = State::load(root)?;
     let next = prepare_state(spec, &current);
     emit::write_artifacts(root, spec, &next)?;
-    Ok("Wrote .tofy/spec.json and .tofy/main.tf.json\n".into())
+    Ok("Wrote .tofy/spec.json\n".into())
 }
 
 #[cfg(test)]
@@ -359,12 +360,34 @@ mod tests {
         assert!(matches!(err, Error::DockerMissing), "{err}");
         assert!(!err.to_string().contains("Applied"));
         assert!(dir.path().join(".tofy").join("spec.json").exists());
-        assert!(dir.path().join(".tofy").join("main.tf.json").exists());
+        assert!(!dir.path().join(".tofy").join("main.tf.json").exists());
+        assert!(!dir.path().join(".tofy").join("docker-compose.yml").exists());
         let first = outputs::load(dir.path()).unwrap();
         let again = apply(dir.path(), &spec).unwrap_err();
         assert!(matches!(again, Error::DockerMissing));
         let second = outputs::load(dir.path()).unwrap();
         assert_eq!(first["TOFY_APPDB_PASSWORD"], second["TOFY_APPDB_PASSWORD"]);
         assert!(!first["TOFY_APPDB_PASSWORD"].starts_with("tofy-"));
+        assert!(first.contains_key("TOFY_CACHE_PASSWORD"));
+        assert_eq!(first["TOFY_CACHE_PASSWORD"], second["TOFY_CACHE_PASSWORD"]);
+    }
+
+    #[test]
+    fn destroy_without_docker_leaves_state() {
+        if docker::available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let state = prepare_state(&spec, &State::default());
+        state.save(dir.path()).unwrap();
+        outputs::write(dir.path(), &state).unwrap();
+        let before = std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
+        let err = destroy(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::DestroyNeedsDocker), "{err}");
+        assert!(!err.to_string().contains("Destroyed"));
+        let after = std::fs::read_to_string(dir.path().join(".tofy").join("state.json")).unwrap();
+        assert_eq!(before, after);
+        assert!(dir.path().join(".tofy").join("outputs.env").exists());
     }
 }

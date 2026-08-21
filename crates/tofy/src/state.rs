@@ -164,11 +164,16 @@ pub fn outputs_for(
             out.insert("internal_port".into(), internal_port.to_string());
         }
         Kind::Redis => {
-            out.insert("uri".into(), format!("redis://127.0.0.1:{port}"));
+            let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
+            out.insert(
+                "uri".into(),
+                format!("redis://:{password}@127.0.0.1:{port}"),
+            );
             out.insert(
                 "internal_uri".into(),
-                format!("redis://{in_host}:{internal_port}"),
+                format!("redis://:{password}@{in_host}:{internal_port}"),
             );
+            out.insert("password".into(), password);
             out.insert("host".into(), "127.0.0.1".into());
             out.insert("port".into(), port.to_string());
             out.insert("internal_host".into(), in_host.to_string());
@@ -270,6 +275,24 @@ mod tests {
         assert_eq!(outs["internal_host"], "appdb");
         assert_eq!(outs["internal_port"], "5432");
         assert_eq!(outs["bind"], "127.0.0.1");
+    }
+
+    #[test]
+    fn redis_password_generated_once_and_in_uri() {
+        let mut spec = Project::new("demo");
+        spec.resources.push(Resource::new("cache", Kind::Redis));
+        let first = prepare_state(&spec, &State::default());
+        let pass = first.resources["cache"].outputs["password"].clone();
+        assert_eq!(pass.len(), 32);
+        assert!(!pass.starts_with("tofy-"));
+        assert!(first.resources["cache"].outputs["uri"]
+            .contains(&format!("redis://:{pass}@127.0.0.1:")));
+        let second = prepare_state(&spec, &first);
+        assert_eq!(pass, second.resources["cache"].outputs["password"]);
+        assert_eq!(
+            first.resources["cache"].outputs["uri"],
+            second.resources["cache"].outputs["uri"]
+        );
     }
 
     #[test]

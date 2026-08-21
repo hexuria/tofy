@@ -43,6 +43,8 @@ fn smoke_apply_example_if_docker() {
     assert!(outs.contains_key("TOFY_APPDB_URI"));
     assert!(outs.contains_key("TOFY_APPDB_PASSWORD"));
     assert!(outs.contains_key("TOFY_CACHE_URI"));
+    assert!(outs.contains_key("TOFY_CACHE_PASSWORD"));
+    assert!(outs["TOFY_CACHE_URI"].contains(&outs["TOFY_CACHE_PASSWORD"]));
     assert!(outs.contains_key("TOFY_UPLOADS_SECRET_KEY"));
     assert_eq!(
         outs.get("TOFY_UPLOADS_BUCKET").map(String::as_str),
@@ -67,5 +69,6 @@ fn smoke_apply_example_if_docker() {
     let destroyed = engine::destroy(root).expect("destroy");
     assert!(destroyed.contains("Destroyed"), "{destroyed}");
     assert!(!Path::new(&root.join(".tofy").join("outputs.env")).exists());
-    assert!(root.join(".tofy").join("main.tf.json").exists());
+    assert!(!root.join(".tofy").join("main.tf.json").exists());
+    assert!(!root.join(".tofy").join("docker-compose.yml").exists());
 }

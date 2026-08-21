@@ -60,6 +60,6 @@ After apply, other languages **do not** import tofy.
 - `tofy run -- <cmd>` injects `TOFY_*` and execs
 - or read `.tofy/outputs.env` / `.tofy/outputs.json`
 
-`TOFY_APPDB_URI` is the host loopback URI for the laptop. A sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`).
+`TOFY_APPDB_URI` is the host loopback URI for the laptop. A sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`). Redis is the same shape with a password: `TOFY_CACHE_URI` is `redis://:<password>@127.0.0.1:…` and `TOFY_CACHE_PASSWORD` is the secret.
 
 The JSON IR (`Project` / `Resource` / `Kind` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.

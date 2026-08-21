@@ -29,11 +29,13 @@ fn main() {
 1. Plans the declared stack against `.tofy/state.json`.
 2. Creates a private Docker network for the stack. Resources resolve each other by name (`appdb`, `cache`, `uploads`).
 3. Generates secrets once (passwords, object-store keys) and persists them in state. They are never re-derived as `tofy-{project}-{name}`.
-4. Starts containers with Docker. Published ports default to `127.0.0.1`. After Postgres starts, apply waits until it accepts connections. After the object store starts, apply waits until it accepts connections and creates the bucket named after the resource (`uploads` → that bucket exists).
-5. Writes `.tofy/outputs.env` and `.tofy/outputs.json`. Host consumers (`tofy run` on the laptop) get `127.0.0.1` URIs. Sibling containers on the stack network use `INTERNAL_*` keys (`postgres://…@appdb:5432/…`).
+4. Starts containers with Docker. Published ports default to `127.0.0.1`. Apply waits until Postgres, Redis, and the object store accept connections (Redis AUTH, named bucket created). A dead port is not Applied.
+5. Writes `.tofy/outputs.env` and `.tofy/outputs.json` (mode `0600`). Host consumers (`tofy run` on the laptop) get `127.0.0.1` URIs. Sibling containers on the stack network use `INTERNAL_*` keys (`postgres://…@appdb:5432/…`).
 6. `tofy run -- <cmd>` injects those env vars and execs. Apps do not depend on dotenv.
 
-If Docker is missing: artifacts are emitted, the process exits non-zero, and apply does **not** claim Applied.
+Apply writes `spec.json` (IR, no secrets). It does **not** write `docker-compose.yml` or `main.tf.json` — those would embed live passwords.
+
+If Docker is missing: spec JSON may be written, the process exits non-zero, and apply does **not** claim Applied. Destroy also requires Docker: it errors and leaves state alone. It does not print Destroyed.
 
 OpenTofu is the phase 2 **engine**, not a command you run yourself. Phase 1 does not print “go run `tofu apply`.”
 
@@ -59,7 +61,7 @@ tofy --dir examples/infra destroy
 tofy --dir . apply --spec spec.json
 ```
 
-`tofy plan` redacts passwords. `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state (keeps emitted `main.tf.json` if you emitted it).
+`tofy plan` redacts passwords. `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state. If Docker is missing, destroy errors and does not clear state.
 
 ## Env vars
 
@@ -69,7 +71,7 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 | --- | --- |
 | stack | `TOFY_NETWORK` (`tofy-demo`) |
 | `appdb` (postgres) | `TOFY_APPDB_URI`, `TOFY_APPDB_PASSWORD`, `TOFY_APPDB_USER`, `TOFY_APPDB_DATABASE`, `TOFY_APPDB_PORT`, `TOFY_APPDB_HOST`, plus `TOFY_APPDB_INTERNAL_*` |
-| `cache` (redis) | `TOFY_CACHE_URI`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*` |
+| `cache` (redis) | `TOFY_CACHE_URI` (`redis://:<password>@127.0.0.1:…`), `TOFY_CACHE_PASSWORD`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*` |
 | `uploads` (bucket) | `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*` |
 
 **Host vs in-stack.** `tofy run` and processes on the laptop use loopback (`TOFY_APPDB_URI=postgres://…@127.0.0.1:5433/…`). Another container on the private network uses the resource DNS name and the container port (`TOFY_APPDB_INTERNAL_URI=postgres://…@appdb:5432/…`).
@@ -88,7 +90,7 @@ Attributes, not new resource types. Language stays `postgres`, `redis`, `bucket`
 
 The local backend has no HA. There is no `.replicas()` on `postgres`, `redis`, or `bucket`. The IR field exists (default 1) for a later backend. `replicas > 1` in JSON is rejected: `local backend has no HA`. Plan treats size and bind changes as updates.
 
-`.bind(Bind::Localhost)` (default) or `.bind(Bind::All)` (`0.0.0.0`) is who can reach the **published** port. In-stack traffic still uses the private network.
+`.bind(Bind::Localhost)` (default) or `.bind(Bind::All)` (`0.0.0.0`) is who can reach the **published** port. In-stack traffic still uses the private network. Redis always has `requirepass` (password in `TOFY_CACHE_PASSWORD` / URI) so `Bind::All` is not an open unauthenticated Redis.
 
 **Out of scope (real Terraform / OpenTofu):** VPCs, subnets, security groups, load balancers, IAM.
 
@@ -108,7 +110,7 @@ If Docker is missing, the job **fails**. It does not skip. It does not treat “
 
 **Not Shuttle.** Shuttle's macros provision on Shuttle's cloud. tofy declarations are desired state. You apply them on your machine (Docker today, OpenTofu later). The process that runs your app only reads env.
 
-**Not Compose.** Compose is a container file format. tofy is a control language plus a planner. The local backend may start containers with Docker and may write a compose file as an artifact. You do not write that file, and tofy is not `docker compose` with extra steps.
+**Not Compose.** Compose is a container file format. tofy is a control language plus a planner. The local backend starts containers with Docker. Apply does not write a compose file.
 
 **Not just OpenTofu.** OpenTofu is a later backend ([PLAN.md](PLAN.md) phase 2). The product is the Rust frontend and the IR. You do not run `tofu apply` yourself in phase 1.
 

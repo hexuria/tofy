@@ -100,12 +100,16 @@ mod tests {
         assert!(flat.contains_key("TOFY_APPDB_URI"));
         assert!(flat.contains_key("TOFY_APPDB_PASSWORD"));
         assert!(flat.contains_key("TOFY_CACHE_URI"));
+        assert!(flat.contains_key("TOFY_CACHE_PASSWORD"));
         assert_eq!(flat["TOFY_NETWORK"], "tofy-demo");
         assert!(flat["TOFY_APPDB_URI"].contains("@127.0.0.1:"));
         assert!(flat["TOFY_APPDB_INTERNAL_URI"].contains("@appdb:5432/"));
+        assert!(flat["TOFY_CACHE_URI"].starts_with("redis://:"));
+        assert!(flat["TOFY_CACHE_URI"].contains(&flat["TOFY_CACHE_PASSWORD"]));
         let public = format_public(&flat);
         assert!(!public.contains("PASSWORD"));
         assert!(!public.contains(&flat["TOFY_APPDB_PASSWORD"]));
+        assert!(!public.contains(&flat["TOFY_CACHE_PASSWORD"]));
         assert!(public.contains("TOFY_APPDB_PORT=5433"));
         assert!(public.contains("TOFY_CACHE_PORT=6379"));
         assert!(public.contains("TOFY_APPDB_INTERNAL_HOST=appdb"));

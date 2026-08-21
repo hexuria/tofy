@@ -130,15 +130,22 @@ pub fn compose_yaml(spec: &Project, state: &State) -> String {
     s
 }
 
-pub fn write_artifacts(root: &Path, spec: &Project, state: &State) -> Result<()> {
+/// Write the language-agnostic spec JSON only.
+///
+/// Apply does **not** write `docker-compose.yml` or `main.tf.json`. Those
+/// would embed live passwords and object-store keys. Secrets live in
+/// `.tofy/state.json` and outputs (mode `0600`).
+pub fn write_artifacts(root: &Path, spec: &Project, _state: &State) -> Result<()> {
     let dir = root.join(".tofy");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("spec.json"), spec.to_json_pretty()?)?;
-    std::fs::write(
-        dir.join("main.tf.json"),
-        serde_json::to_string_pretty(&terraform_json(spec, state))?,
-    )?;
-    std::fs::write(dir.join("docker-compose.yml"), compose_yaml(spec, state))?;
+    // Drop leftover secret-bearing artifacts from older applies.
+    for name in ["docker-compose.yml", "main.tf.json"] {
+        let p = dir.join(name);
+        if p.exists() {
+            std::fs::remove_file(p)?;
+        }
+    }
     Ok(())
 }
 
@@ -213,5 +220,23 @@ mod tests {
         assert_eq!(containers.len(), 2);
         assert!(containers.contains_key("cache"));
         assert!(containers.contains_key("uploads"));
+    }
+
+    #[test]
+    fn apply_artifacts_are_spec_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = Project::new("demo");
+        spec.resources.push(Resource::new("appdb", Kind::Postgres));
+        spec.resources.push(Resource::new("cache", Kind::Redis));
+        spec.resources.push(Resource::new("uploads", Kind::Bucket));
+        let state = prepare_state(&spec, &State::default());
+        write_artifacts(dir.path(), &spec, &state).unwrap();
+        assert!(dir.path().join(".tofy").join("spec.json").exists());
+        assert!(!dir.path().join(".tofy").join("main.tf.json").exists());
+        assert!(!dir.path().join(".tofy").join("docker-compose.yml").exists());
+        let spec_text =
+            std::fs::read_to_string(dir.path().join(".tofy").join("spec.json")).unwrap();
+        assert!(!spec_text.to_lowercase().contains("password"));
+        assert!(!spec_text.contains("POSTGRES_PASSWORD"));
     }
 }

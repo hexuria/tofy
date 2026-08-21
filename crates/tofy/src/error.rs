@@ -10,6 +10,8 @@ pub enum Error {
     Engine(String),
     #[error("Docker is not available; emitted artifacts to .tofy but did not apply.")]
     DockerMissing,
+    #[error("Docker is not available; did not destroy. State left unchanged.")]
+    DestroyNeedsDocker,
     #[error("another tofy apply or destroy is already running in this directory")]
     Locked,
     #[error("{0}")]

@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -194,7 +195,12 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
             cmd.arg(docker_image(r));
         }
         Kind::Redis => {
+            let password = rs
+                .outputs
+                .get("password")
+                .ok_or_else(|| Error::Engine("redis password missing from state".into()))?;
             cmd.arg(docker_image(r));
+            cmd.args(["redis-server", "--requirepass", password]);
         }
         Kind::Bucket => {
             let access = rs
@@ -235,7 +241,15 @@ pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Resul
 fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<()> {
     match r.kind {
         Kind::Postgres => wait_for_postgres(container, rs.port),
+        Kind::Redis => {
+            let password = rs
+                .outputs
+                .get("password")
+                .ok_or_else(|| Error::Engine("redis password missing from state".into()))?;
+            wait_for_redis(rs.port, password)
+        }
         Kind::Bucket => {
+            wait_tcp("object store", rs.port)?;
             crate::s3::wait_for_object_store(rs.port)?;
             let access = rs
                 .outputs
@@ -247,7 +261,6 @@ fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<(
                 .ok_or_else(|| Error::Engine("bucket secret_key missing from state".into()))?;
             crate::s3::ensure_bucket(rs.port, access, secret, &r.name)
         }
-        Kind::Redis => Ok(()),
     }
 }
 
@@ -273,6 +286,64 @@ pub fn wait_for_postgres(container: &str, port: u16) -> Result<()> {
             )));
         }
         thread::sleep(Duration::from_millis(400));
+    }
+}
+
+pub fn wait_for_redis(port: u16, password: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if redis_ready(port, password) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Engine(format!(
+                "Redis on 127.0.0.1:{port} did not accept AUTH within 60s"
+            )));
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+}
+
+fn wait_tcp(label: &str, port: u16) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if tcp_open(port) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Engine(format!(
+                "{label} on 127.0.0.1:{port} did not accept connections within 60s"
+            )));
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+}
+
+fn redis_ready(port: u16, password: &str) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(400)))
+        .ok();
+    if stream
+        .write_all(format!("AUTH {password}\r\nPING\r\n").as_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 128];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let s = String::from_utf8_lossy(&buf[..n]);
+            s.contains("+PONG")
+        }
+        _ => false,
     }
 }
 

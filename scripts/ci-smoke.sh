@@ -68,6 +68,7 @@ elif envp.exists():
 need = [
     "TOFY_APPDB_PORT",
     "TOFY_CACHE_PORT",
+    "TOFY_CACHE_PASSWORD",
     "TOFY_UPLOADS_PORT",
     "TOFY_UPLOADS_BUCKET",
     "TOFY_UPLOADS_ENDPOINT",
@@ -83,7 +84,7 @@ for key in need:
     print(f"{key}={shlex.quote(str(data[key]))}")
 PY
 )"
-export TOFY_APPDB_PORT TOFY_CACHE_PORT TOFY_UPLOADS_PORT \
+export TOFY_APPDB_PORT TOFY_CACHE_PORT TOFY_CACHE_PASSWORD TOFY_UPLOADS_PORT \
   TOFY_UPLOADS_BUCKET TOFY_UPLOADS_ENDPOINT TOFY_UPLOADS_ACCESS_KEY TOFY_UPLOADS_SECRET_KEY \
   TOFY_NETWORK TOFY_APPDB_URI
 echo "TOFY_APPDB_PORT=$TOFY_APPDB_PORT TOFY_CACHE_PORT=$TOFY_CACHE_PORT TOFY_UPLOADS_PORT=$TOFY_UPLOADS_PORT TOFY_UPLOADS_BUCKET=$TOFY_UPLOADS_BUCKET TOFY_NETWORK=$TOFY_NETWORK"
@@ -126,12 +127,12 @@ fi
 
 echo "== redis on published host port =="
 if command -v redis-cli >/dev/null 2>&1; then
-  pong="$(redis-cli -h 127.0.0.1 -p "$TOFY_CACHE_PORT" ping)"
+  pong="$(REDISCLI_AUTH="$TOFY_CACHE_PASSWORD" redis-cli -h 127.0.0.1 -p "$TOFY_CACHE_PORT" ping)"
   if [[ "$pong" != "PONG" ]]; then
-    echo "redis-cli -h 127.0.0.1 -p $TOFY_CACHE_PORT ping => $pong"
+    echo "redis-cli AUTH ping => $pong"
     exit 1
   fi
-  echo "redis-cli PONG on 127.0.0.1:$TOFY_CACHE_PORT"
+  echo "redis-cli AUTH PONG on 127.0.0.1:$TOFY_CACHE_PORT"
 fi
 python3 - <<PY
 import socket, sys, time
