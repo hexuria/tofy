@@ -72,6 +72,20 @@ pub enum ImportFormat {
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
     },
+    /// Docker-provider OpenTofu JSON → JSON IR (not auto-loaded, not a write path)
+    Tofu {
+        /// OpenTofu JSON (`main.tf.json`)
+        file: PathBuf,
+        /// Stack name (else docker_network.stack labels / name)
+        #[arg(long)]
+        project: Option<String>,
+        /// IR backend: local, tofu, or aws (default local)
+        #[arg(long, value_parser = parse_backend)]
+        backend: Option<Backend>,
+        /// Write JSON IR here. Omit to print stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
@@ -171,21 +185,34 @@ fn run_import(format: ImportFormat) -> Result<()> {
             project,
             backend,
             output,
-        } => {
-            let spec = import::from_compose_file(
+        } => write_imported(
+            import::from_compose_file(
                 &file,
                 project.as_deref(),
                 backend.unwrap_or(Backend::Local),
-            )?;
-            if let Some(path) = output {
-                import::write_spec_json(&spec, &path)?;
-                println!("Wrote {}", path.display());
-            } else {
-                print!("{}", spec.to_json_pretty()?);
-            }
-            Ok(())
-        }
+            )?,
+            output,
+        ),
+        ImportFormat::Tofu {
+            file,
+            project,
+            backend,
+            output,
+        } => write_imported(
+            import::from_tofu_file(&file, project.as_deref(), backend.unwrap_or(Backend::Local))?,
+            output,
+        ),
     }
+}
+
+fn write_imported(spec: Project, output: Option<PathBuf>) -> Result<()> {
+    if let Some(path) = output {
+        import::write_spec_json(&spec, &path)?;
+        println!("Wrote {}", path.display());
+    } else {
+        print!("{}", spec.to_json_pretty()?);
+    }
+    Ok(())
 }
 
 fn load_spec(
