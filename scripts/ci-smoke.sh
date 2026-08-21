@@ -231,6 +231,71 @@ if port and f"@127.0.0.1:{port}/" not in u:
 print("TOFY_APPDB_URI is set for the host")
 '
 
+echo "== drift: stop cache, plan must show a change =="
+if ! docker stop tofy-demo-cache >/dev/null; then
+  echo "failed to stop tofy-demo-cache"
+  exit 1
+fi
+set +e
+"${BIN[@]}" plan | tee /tmp/tofy-plan-drift.log
+PLAN_EC=${PIPESTATUS[0]}
+set -e
+if [[ "$PLAN_EC" -ne 0 ]]; then
+  echo "plan exited $PLAN_EC"
+  exit "$PLAN_EC"
+fi
+if grep -q "No changes." /tmp/tofy-plan-drift.log; then
+  echo "plan ignored a stopped container"
+  exit 1
+fi
+if ! grep -E "not running|~ update|\\+ create" /tmp/tofy-plan-drift.log; then
+  echo "plan did not explain drift"
+  cat /tmp/tofy-plan-drift.log
+  exit 1
+fi
+if grep -qi password /tmp/tofy-plan-drift.log; then
+  echo "plan printed a password"
+  exit 1
+fi
+
+echo "== apply heals drift =="
+set +e
+"${BIN[@]}" apply | tee /tmp/tofy-heal.log
+HEAL_EC=${PIPESTATUS[0]}
+set -e
+if [[ "$HEAL_EC" -ne 0 ]]; then
+  echo "heal apply exited $HEAL_EC"
+  exit "$HEAL_EC"
+fi
+if ! grep -q "Applied." /tmp/tofy-heal.log; then
+  echo "heal apply did not print Applied."
+  exit 1
+fi
+if grep -qi "Destroyed" /tmp/tofy-heal.log; then
+  echo "heal apply printed Destroyed"
+  exit 1
+fi
+if ! docker ps --format '{{.Names}}' | grep -qx tofy-demo-cache; then
+  echo "tofy-demo-cache is not running after heal"
+  docker ps -a
+  exit 1
+fi
+set +e
+"${BIN[@]}" plan | tee /tmp/tofy-plan-healed.log
+set -e
+if ! grep -q "No changes." /tmp/tofy-plan-healed.log; then
+  echo "plan still shows drift after apply"
+  cat /tmp/tofy-plan-healed.log
+  exit 1
+fi
+if command -v redis-cli >/dev/null 2>&1; then
+  pong="$(REDISCLI_AUTH="$TOFY_CACHE_PASSWORD" redis-cli -h 127.0.0.1 -p "$TOFY_CACHE_PORT" ping)"
+  if [[ "$pong" != "PONG" ]]; then
+    echo "redis after heal AUTH ping => $pong"
+    exit 1
+  fi
+fi
+
 echo "== destroy =="
 "${BIN[@]}" destroy
 

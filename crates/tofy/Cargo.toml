@@ -27,6 +27,9 @@ thiserror.workspace = true
 tofy-macros.workspace = true
 tofy-spec.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
 [dev-dependencies]
 tempfile = "=3.14.0"
 trybuild = "=1.0.101"

@@ -32,7 +32,7 @@ stack("demo").backend(Backend::Tofu).add(db).add(cache).add(files).apply();
 
 ## What apply does
 
-1. Plans the declared stack against `.tofy/state.json`.
+1. Plans the declared stack against `.tofy/state.json` **and live containers** (running, image, published port/bind). A `docker stop` or a remapped publish is a change.
 2. Creates a private Docker network for the stack. Resources resolve each other by name (`appdb`, `cache`, `uploads`).
 3. Generates secrets once (passwords, object-store keys) and persists them in state. They are never re-derived as `tofy-{project}-{name}`.
 4. Starts containers. The local backend uses Docker directly. The Tofu backend emits a docker-provider config and runs the OpenTofu engine. Published ports default to `127.0.0.1`. Apply waits until Postgres, Redis, and the object store accept connections (Redis AUTH, named bucket created). A dead port is not Applied.
@@ -70,7 +70,7 @@ tofy --dir examples/infra destroy
 tofy --dir . apply --spec spec.json
 ```
 
-`tofy plan` redacts passwords. `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state. If Docker is missing (local backend), or the OpenTofu engine is missing (Tofu backend), destroy errors and does not clear state.
+`tofy plan` refreshes live containers against `.tofy/state.json` and redacts passwords. A stopped or remapped container is a change, with a reason (`not running`, `port changed`). `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state. If Docker is missing (local backend), or the OpenTofu engine is missing (Tofu backend), destroy errors and does not clear state. A second apply or destroy in the same directory while one is running is `Locked` (exclusive `flock`; a crash does not leave a permanent lock).
 
 ## Env vars
 
@@ -116,7 +116,10 @@ Both jobs:
 1. Apply must exit 0, state `applied`
 2. Health checks: containers running, Postgres accepts connections, Redis PING, named object-store bucket exists (not just TCP)
 3. `tofy run` can read `TOFY_APPDB_URI`
-4. `tofy destroy` and containers plus the stack network are gone
+4. After apply, stop a container: `tofy plan` must not print `No changes.`; apply heals; probes still pass
+5. `tofy destroy` and containers plus the stack network are gone
+
+`cargo test` holds the apply lock and asserts a second apply/destroy is `Locked`. Skip-without-Docker or skip-without-tofu is a fail.
 
 ## What this is not
 

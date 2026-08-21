@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use tofy_spec::{Backend, Kind, Project};
+use tofy_spec::{replica_container, Backend, Kind, Project};
 
-use crate::docker;
+use crate::docker::{self, ContainerFacts, ContainerLive};
 use crate::emit;
 use crate::error::{Error, Result};
 use crate::lock::Lock;
@@ -25,47 +26,80 @@ impl Action {
 }
 
 pub fn plan(spec: &Project, current: &State) -> Vec<Action> {
+    plan_with_live(spec, current, &BTreeMap::new())
+}
+
+/// Plan declared spec against persisted state, then overlay live container facts.
+///
+/// An empty `live` map is spec-vs-state only (unit tests). A present entry means
+/// the engine inspected Docker: [`ContainerLive::Missing`] is gone, not "unknown".
+pub fn plan_with_live(
+    spec: &Project,
+    current: &State,
+    live: &BTreeMap<String, ContainerLive>,
+) -> Vec<Action> {
     let desired = prepare_state(spec, current);
     let mut actions = Vec::new();
     for (name, want) in &desired.resources {
-        match current.resources.get(name) {
-            None => actions.push(Action::Create {
+        let have = current.resources.get(name);
+        let mut changed: Vec<&str> = Vec::new();
+        let mut create = have.is_none();
+        let mut not_running = false;
+
+        if let Some(have) = have {
+            if have.kind != want.kind {
+                changed.push("type");
+            }
+            if have.image != want.image {
+                changed.push("image");
+            }
+            if have.port != want.port {
+                changed.push("port");
+            }
+            if have.size != want.size {
+                changed.push("size");
+            }
+            if have.bind != want.bind {
+                changed.push("bind");
+            }
+            if have.replicas != want.replicas {
+                changed.push("replicas");
+            }
+        }
+
+        if let Some(status) = live.get(name) {
+            match status {
+                ContainerLive::Missing if have.is_some() => {
+                    create = true;
+                }
+                ContainerLive::Missing => {}
+                ContainerLive::Present(facts) => {
+                    overlay_present(
+                        facts,
+                        &want.image,
+                        want.port,
+                        want.bind.as_ip(),
+                        &spec.project,
+                        name,
+                        &mut changed,
+                        &mut not_running,
+                    );
+                }
+            }
+        }
+
+        if create {
+            actions.push(Action::Create {
                 name: name.clone(),
                 kind: want.kind,
-            }),
-            Some(have)
-                if have.kind != want.kind
-                    || have.image != want.image
-                    || have.port != want.port
-                    || have.size != want.size
-                    || have.bind != want.bind
-                    || have.replicas != want.replicas =>
-            {
-                let mut parts = Vec::new();
-                if have.kind != want.kind {
-                    parts.push("type");
-                }
-                if have.image != want.image {
-                    parts.push("image");
-                }
-                if have.port != want.port {
-                    parts.push("port");
-                }
-                if have.size != want.size {
-                    parts.push("size");
-                }
-                if have.bind != want.bind {
-                    parts.push("bind");
-                }
-                if have.replicas != want.replicas {
-                    parts.push("replicas");
-                }
-                actions.push(Action::Update {
-                    name: name.clone(),
-                    reason: parts.join(", ") + " changed",
-                });
-            }
-            Some(_) => actions.push(Action::Noop { name: name.clone() }),
+            });
+        } else if not_running || !changed.is_empty() {
+            actions.push(Action::Update {
+                name: name.clone(),
+                reason: format_update_reason(not_running, &changed),
+            });
+        } else {
+            actions.push(Action::Noop { name: name.clone() });
         }
     }
     for (name, have) in &current.resources {
@@ -77,6 +111,64 @@ pub fn plan(spec: &Project, current: &State) -> Vec<Action> {
         }
     }
     actions
+}
+
+fn overlay_present(
+    facts: &ContainerFacts,
+    want_image: &str,
+    want_port: u16,
+    want_bind: &str,
+    project: &str,
+    resource: &str,
+    changed: &mut Vec<&str>,
+    not_running: &mut bool,
+) {
+    if !facts.running {
+        *not_running = true;
+    }
+    if !docker::image_matches(want_image, facts) && !changed.contains(&"image") {
+        changed.push("image");
+    }
+    match facts.host_port {
+        Some(p) if p != want_port && !changed.contains(&"port") => changed.push("port"),
+        None if facts.running && !changed.contains(&"port") => changed.push("port"),
+        _ => {}
+    }
+    if let Some(ip) = facts.host_ip.as_deref() {
+        let live_ip = if ip.is_empty() { "0.0.0.0" } else { ip };
+        if live_ip != want_bind && !changed.contains(&"bind") {
+            changed.push("bind");
+        }
+    }
+    let labels_ok =
+        facts.project.as_deref() == Some(project) && facts.resource.as_deref() == Some(resource);
+    if !labels_ok && !changed.contains(&"labels") {
+        changed.push("labels");
+    }
+}
+
+fn format_update_reason(not_running: bool, changed: &[&str]) -> String {
+    match (not_running, changed.is_empty()) {
+        (true, true) => "not running".into(),
+        (true, false) => format!("not running, {} changed", changed.join(", ")),
+        (false, false) => format!("{} changed", changed.join(", ")),
+        (false, true) => "changed".into(),
+    }
+}
+
+fn observe_live(spec: &Project) -> BTreeMap<String, ContainerLive> {
+    let mut live = BTreeMap::new();
+    if !docker::available() {
+        return live;
+    }
+    for r in &spec.resources {
+        let cname = replica_container(&spec.project, &r.name, 0);
+        live.insert(
+            r.name.clone(),
+            docker::inspect_live(&cname, r.kind.internal_port()),
+        );
+    }
+    live
 }
 
 pub fn format_actions(actions: &[Action]) -> String {
@@ -109,14 +201,16 @@ pub fn format_actions(actions: &[Action]) -> String {
 pub fn plan_text(root: &Path, spec: &Project) -> Result<String> {
     spec.validate()?;
     let current = State::load(root)?;
-    Ok(format_actions(&plan(spec, &current)))
+    let live = observe_live(spec);
+    Ok(format_actions(&plan_with_live(spec, &current, &live)))
 }
 
 pub fn apply(root: &Path, spec: &Project) -> Result<String> {
     spec.validate()?;
     let _lock = Lock::acquire(root)?;
     let current = State::load(root)?;
-    let actions = plan(spec, &current);
+    let live = observe_live(spec);
+    let actions = plan_with_live(spec, &current, &live);
     let mut next = prepare_state(spec, &current);
     emit::write_artifacts(root, spec, &next)?;
 
@@ -184,13 +278,13 @@ fn apply_local(
             | Action::Delete { name, .. } => name == &r.name,
         });
         match action {
-            Some(Action::Create { .. }) | Some(Action::Update { .. }) => {
-                docker::start_resource(spec, r, rs)?;
-            }
-            Some(Action::Noop { .. }) | None => {
+            Some(Action::Delete { .. }) => {}
+            Some(Action::Create { .. }) => docker::start_resource(spec, r, rs)?,
+            Some(Action::Update { reason, .. }) if reason == "not running" => {
                 docker::ensure_running(spec, r, rs)?;
             }
-            Some(Action::Delete { .. }) => {}
+            Some(Action::Update { .. }) => docker::start_resource(spec, r, rs)?,
+            Some(Action::Noop { .. }) | None => docker::ensure_running(spec, r, rs)?,
         }
     }
 
@@ -412,6 +506,131 @@ mod tests {
         desired.resources[0].bind = tofy_spec::Bind::All;
         let text = format_actions(&plan(&desired, &current));
         assert!(text.contains("bind changed"), "{text}");
+    }
+
+    fn live_ok(name: &str, image: &str, port: u16, bind: &str) -> ContainerLive {
+        ContainerLive::Present(ContainerFacts {
+            running: true,
+            image: Some(image.into()),
+            image_id: None,
+            host_ip: Some(bind.into()),
+            host_port: Some(port),
+            project: Some("demo".into()),
+            resource: Some(name.into()),
+        })
+    }
+
+    #[test]
+    fn plan_detects_stopped_container() {
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let current = state_from(&spec);
+        let mut live = BTreeMap::new();
+        let mut facts = match live_ok("cache", "redis:7", 6379, "127.0.0.1") {
+            ContainerLive::Present(f) => f,
+            ContainerLive::Missing => unreachable!(),
+        };
+        facts.running = false;
+        live.insert("cache".into(), ContainerLive::Present(facts));
+        let actions = plan_with_live(&spec, &current, &live);
+        let text = format_actions(&actions);
+        assert!(text.contains("~ update  cache"), "{text}");
+        assert!(text.contains("not running"), "{text}");
+        assert!(!text.contains("No changes."));
+        assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_detects_missing_container_as_create() {
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let current = state_from(&spec);
+        let mut live = BTreeMap::new();
+        live.insert("cache".into(), ContainerLive::Missing);
+        let actions = plan_with_live(&spec, &current, &live);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Create { name, .. } if name == "cache")));
+        let text = format_actions(&actions);
+        assert!(text.contains("+ create  cache"), "{text}");
+        assert!(!text.contains("No changes."));
+        assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_detects_port_and_bind_drift() {
+        let spec = spec(&[("appdb", Kind::Postgres, Some(5433))]);
+        let current = state_from(&spec);
+        let mut live = BTreeMap::new();
+        live.insert(
+            "appdb".into(),
+            live_ok("appdb", "postgres:16", 5555, "0.0.0.0"),
+        );
+        let text = format_actions(&plan_with_live(&spec, &current, &live));
+        assert!(text.contains("~ update  appdb"), "{text}");
+        assert!(text.contains("port"), "{text}");
+        assert!(text.contains("bind"), "{text}");
+        assert!(!text.contains("No changes."));
+        assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_detects_image_and_label_drift() {
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let current = state_from(&spec);
+        let mut live = BTreeMap::new();
+        live.insert(
+            "cache".into(),
+            ContainerLive::Present(ContainerFacts {
+                running: true,
+                image: Some("redis:6".into()),
+                image_id: None,
+                host_ip: Some("127.0.0.1".into()),
+                host_port: Some(6379),
+                project: Some("other".into()),
+                resource: Some("cache".into()),
+            }),
+        );
+        let text = format_actions(&plan_with_live(&spec, &current, &live));
+        assert!(text.contains("image"), "{text}");
+        assert!(text.contains("labels"), "{text}");
+        assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_live_match_is_still_noop() {
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let current = state_from(&spec);
+        let mut live = BTreeMap::new();
+        live.insert(
+            "cache".into(),
+            live_ok("cache", "redis:7", 6379, "127.0.0.1"),
+        );
+        let actions = plan_with_live(&spec, &current, &live);
+        assert!(actions.iter().all(|a| matches!(a, Action::Noop { .. })));
+        assert_eq!(format_actions(&actions), "No changes.\n");
+    }
+
+    #[test]
+    fn apply_and_destroy_cannot_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = Lock::acquire(dir.path()).unwrap();
+        let spec = spec(&[("cache", Kind::Redis, None)]);
+        let err = apply(dir.path(), &spec).unwrap_err();
+        assert!(matches!(err, Error::Locked), "{err}");
+        assert!(!err.to_string().contains("Applied"));
+        assert!(!err.to_string().contains("Destroyed"));
+        let err = destroy(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Locked), "{err}");
+        assert!(!err.to_string().contains("Destroyed"));
+        assert!(!err.to_string().contains("Applied"));
+        drop(held);
+        // Lock is free. Apply may still fail if Docker is missing — that is not Locked.
+        match apply(dir.path(), &spec) {
+            Ok(_) => {
+                let _ = destroy(dir.path());
+            }
+            Err(Error::Locked) => panic!("lock leaked after drop"),
+            Err(_) => {}
+        }
     }
 
     #[test]

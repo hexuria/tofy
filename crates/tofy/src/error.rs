@@ -18,7 +18,9 @@ pub enum Error {
         "OpenTofu engine is required for this backend; did not destroy. State left unchanged."
     )]
     DestroyNeedsTofu,
-    #[error("another tofy apply or destroy is already running in this directory")]
+    #[error(
+        "another tofy apply or destroy is already running in this directory; did not apply or destroy"
+    )]
     Locked,
     #[error("{0}")]
     Usage(String),
