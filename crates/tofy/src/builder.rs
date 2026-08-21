@@ -29,7 +29,7 @@ pub enum Empty {}
 /// Stack has at least one resource. `add`, `plan`, `apply` only.
 pub enum NonEmpty {}
 
-/// Engine has run. `output` / `run` only — no `add`, no second `apply`.
+/// Engine has applied. `output` / `run` only — no `add`, no second `apply`.
 pub enum Applied {}
 
 /// Kind-specific declarations that can be moved into a stack.
@@ -88,6 +88,7 @@ impl From<Postgres<Open>> for Resource {
 }
 
 /// Redis resource declaration. Not a live client.
+/// `Redis<Open>` has version/port/size/bind. There is no `.replicas()`.
 #[derive(Debug, Clone)]
 pub struct Redis<S> {
     name: String,
@@ -95,7 +96,6 @@ pub struct Redis<S> {
     port: Option<u16>,
     size: Size,
     bind: Bind,
-    replicas: u32,
     _state: PhantomData<S>,
 }
 
@@ -119,11 +119,6 @@ impl Redis<Open> {
         self.bind = bind;
         self
     }
-
-    pub fn replicas(mut self, n: u32) -> Self {
-        self.replicas = n;
-        self
-    }
 }
 
 impl From<Redis<Open>> for Resource {
@@ -135,12 +130,13 @@ impl From<Redis<Open>> for Resource {
             port: r.port,
             size: r.size,
             bind: r.bind,
-            replicas: r.replicas,
+            replicas: 1,
         }
     }
 }
 
 /// Object-storage bucket declaration. Not an SDK client.
+/// `Bucket<Open>` has version/port/size/bind. There is no `.replicas()`.
 #[derive(Debug, Clone)]
 pub struct Bucket<S> {
     name: String,
@@ -148,7 +144,6 @@ pub struct Bucket<S> {
     port: Option<u16>,
     size: Size,
     bind: Bind,
-    replicas: u32,
     _state: PhantomData<S>,
 }
 
@@ -172,11 +167,6 @@ impl Bucket<Open> {
         self.bind = bind;
         self
     }
-
-    pub fn replicas(mut self, n: u32) -> Self {
-        self.replicas = n;
-        self
-    }
 }
 
 impl From<Bucket<Open>> for Resource {
@@ -188,7 +178,7 @@ impl From<Bucket<Open>> for Resource {
             port: b.port,
             size: b.size,
             bind: b.bind,
-            replicas: b.replicas,
+            replicas: 1,
         }
     }
 }
@@ -227,17 +217,23 @@ impl Stack<NonEmpty> {
         }
     }
 
-    /// Hand the stack to the engine. `cargo run` applies; `cargo run -- plan`
-    /// and the other verbs still work. Seals the graph as [`Applied`].
+    /// Apply the stack. Returns [`Stack<Applied>`] only after a real apply.
+    ///
+    /// `cargo run -p infra` (no verb) applies. `cargo run -- plan` (and
+    /// destroy / output / run / emit) run that verb and exit without
+    /// returning Applied.
     pub fn apply(self) -> Stack<Applied> {
         mark_stack_closed();
-        if let Err(e) = crate::cli::run_with_project(self.project.clone()) {
-            eprintln!("tofy: {e}");
-            std::process::exit(e.exit_code());
-        }
-        Stack {
-            project: self.project,
-            _state: PhantomData,
+        match crate::cli::run_declared(self.project.clone()) {
+            Ok(crate::cli::DeclaredOutcome::Applied) => Stack {
+                project: self.project,
+                _state: PhantomData,
+            },
+            Ok(crate::cli::DeclaredOutcome::Finished) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("tofy: {e}");
+                std::process::exit(e.exit_code());
+            }
         }
     }
 
@@ -308,7 +304,6 @@ pub fn redis(name: impl Into<String>) -> Redis<Open> {
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
-        replicas: 1,
         _state: PhantomData,
     }
 }
@@ -320,7 +315,6 @@ pub fn bucket(name: impl Into<String>) -> Bucket<Open> {
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
-        replicas: 1,
         _state: PhantomData,
     }
 }
@@ -344,7 +338,7 @@ mod tests {
             .port(5433)
             .size(Size::Small)
             .bind(Bind::Localhost);
-        let cache = redis("cache").replicas(2).size(Size::Medium);
+        let cache = redis("cache").size(Size::Medium);
         let files = bucket("uploads");
         let project = stack("demo").add(db).add(cache).add(files).into_project();
         assert_eq!(project.project, "demo");
@@ -356,8 +350,9 @@ mod tests {
         assert_eq!(project.resources[0].size, Size::Small);
         assert_eq!(project.resources[0].replicas, 1);
         assert_eq!(project.resources[1].kind, Kind::Redis);
-        assert_eq!(project.resources[1].replicas, 2);
+        assert_eq!(project.resources[1].replicas, 1);
         assert_eq!(project.resources[1].size, Size::Medium);
         assert_eq!(project.resources[2].kind, Kind::Bucket);
+        assert_eq!(project.resources[2].replicas, 1);
     }
 }

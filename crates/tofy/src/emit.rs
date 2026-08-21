@@ -87,55 +87,42 @@ pub fn compose_yaml(spec: &Project, state: &State) -> String {
     let net = docker_network(&spec.project);
     let mut s = String::from("services:\n");
     for r in &spec.resources {
-        let replicas = r.replicas_or_default();
-        for i in 0..replicas {
-            let svc = if i == 0 {
-                r.name.clone()
-            } else {
-                format!("{}-{}", r.name, i + 1)
-            };
-            let outs = state
-                .resources
-                .get(&r.name)
-                .map(|st| st.outputs.clone())
-                .unwrap_or_default();
-            let (env, cmd) = container_env(r.kind, &outs);
-            s.push_str(&format!("  {svc}:\n"));
-            s.push_str(&format!("    image: {}\n", docker_image(r)));
-            s.push_str(&format!(
-                "    container_name: {}\n",
-                tofy_spec::replica_container(&spec.project, &r.name, i)
-            ));
-            s.push_str(&format!("    hostname: {svc}\n"));
-            s.push_str(&format!("    mem_limit: {}\n", r.size.docker_memory()));
-            s.push_str(&format!("    cpus: {}\n", r.size.docker_cpus()));
-            if i == 0 {
-                s.push_str(&format!(
-                    "    ports:\n      - \"{}:{}:{}\"\n",
-                    r.bind.as_ip(),
-                    r.port_or_default(),
-                    r.kind.internal_port()
-                ));
-            }
-            if !env.is_empty() {
-                s.push_str("    environment:\n");
-                for e in env {
-                    let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
-                    s.push_str(&format!("      {k}: \"{v}\"\n"));
-                }
-            }
-            if let Some(cmd) = cmd {
-                s.push_str(&format!("    command: {}\n", cmd.join(" ")));
-            }
-            s.push_str("    networks:\n");
-            s.push_str(&format!(
-                "      stack:\n        aliases:\n          - {}\n",
-                r.name
-            ));
-            if i > 0 {
-                s.push_str(&format!("          - {svc}\n"));
+        let outs = state
+            .resources
+            .get(&r.name)
+            .map(|st| st.outputs.clone())
+            .unwrap_or_default();
+        let (env, cmd) = container_env(r.kind, &outs);
+        s.push_str(&format!("  {}:\n", r.name));
+        s.push_str(&format!("    image: {}\n", docker_image(r)));
+        s.push_str(&format!(
+            "    container_name: {}\n",
+            tofy_spec::container_name(&spec.project, &r.name)
+        ));
+        s.push_str(&format!("    hostname: {}\n", r.name));
+        s.push_str(&format!("    mem_limit: {}\n", r.size.docker_memory()));
+        s.push_str(&format!("    cpus: {}\n", r.size.docker_cpus()));
+        s.push_str(&format!(
+            "    ports:\n      - \"{}:{}:{}\"\n",
+            r.bind.as_ip(),
+            r.port_or_default(),
+            r.kind.internal_port()
+        ));
+        if !env.is_empty() {
+            s.push_str("    environment:\n");
+            for e in env {
+                let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
+                s.push_str(&format!("      {k}: \"{v}\"\n"));
             }
         }
+        if let Some(cmd) = cmd {
+            s.push_str(&format!("    command: {}\n", cmd.join(" ")));
+        }
+        s.push_str("    networks:\n");
+        s.push_str(&format!(
+            "      stack:\n        aliases:\n          - {}\n",
+            r.name
+        ));
     }
     s.push_str("networks:\n");
     s.push_str("  stack:\n");
@@ -200,5 +187,31 @@ fn container_env(
                 ":9001".into(),
             ]),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::prepare_state;
+    use tofy_spec::{Kind, Resource};
+
+    #[test]
+    fn compose_and_terraform_emit_one_container_per_resource() {
+        let mut spec = Project::new("demo");
+        spec.resources
+            .push(Resource::new("cache", Kind::Redis).with_replicas(1));
+        spec.resources
+            .push(Resource::new("uploads", Kind::Bucket).with_replicas(1));
+        let state = prepare_state(&spec, &State::default());
+        let compose = compose_yaml(&spec, &state);
+        let tf = terraform_json(&spec, &state);
+        assert_eq!(compose.matches("container_name:").count(), 2, "{compose}");
+        assert!(!compose.contains("cache-2"), "{compose}");
+        assert!(!compose.contains("uploads-2"), "{compose}");
+        let containers = tf["resource"]["docker_container"].as_object().unwrap();
+        assert_eq!(containers.len(), 2);
+        assert!(containers.contains_key("cache"));
+        assert!(containers.contains_key("uploads"));
     }
 }

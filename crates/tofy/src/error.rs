@@ -4,8 +4,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
     #[error("{0}")]
     Spec(#[from] tofy_spec::SpecError),
     #[error("{0}")]

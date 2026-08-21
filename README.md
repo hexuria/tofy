@@ -14,7 +14,7 @@ fn main() {
         .port(5433)
         .size(Size::Small)
         .bind(Bind::Localhost);
-    let cache = redis("cache").replicas(1);
+    let cache = redis("cache");
     let files = bucket("uploads");
     stack("demo").add(db).add(cache).add(files).apply();
 }
@@ -29,7 +29,7 @@ fn main() {
 1. Plans the declared stack against `.tofy/state.json`.
 2. Creates a private Docker network for the stack. Resources resolve each other by name (`appdb`, `cache`, `uploads`).
 3. Generates secrets once (passwords, object-store keys) and persists them in state. They are never re-derived as `tofy-{project}-{name}`.
-4. Starts containers with Docker. Published ports default to `127.0.0.1`. After Postgres starts, apply waits until it accepts connections.
+4. Starts containers with Docker. Published ports default to `127.0.0.1`. After Postgres starts, apply waits until it accepts connections. After the object store starts, apply waits until it accepts connections and creates the bucket named after the resource (`uploads` → that bucket exists).
 5. Writes `.tofy/outputs.env` and `.tofy/outputs.json`. Host consumers (`tofy run` on the laptop) get `127.0.0.1` URIs. Sibling containers on the stack network use `INTERNAL_*` keys (`postgres://…@appdb:5432/…`).
 6. `tofy run -- <cmd>` injects those env vars and execs. Apps do not depend on dotenv.
 
@@ -76,7 +76,7 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 
 `.tofy/` is gitignored. Do not commit `state.json`, `outputs.env`, or secrets.
 
-## Size, replicas, bind
+## Size and bind
 
 Attributes, not new resource types. Language stays `postgres`, `redis`, `bucket`.
 
@@ -86,7 +86,7 @@ Attributes, not new resource types. Language stays `postgres`, `redis`, `bucket`
 | `medium` | 512MiB, 0.50 CPU | `medium` |
 | `large` | 1GiB, 1.00 CPU | `large` |
 
-`.replicas(n)` exists on `redis` and `bucket` only. Local postgres stays at 1; `replicas > 1` errors with `local backend has no HA`. Plan treats size, replica, and bind changes as updates.
+The local backend has no HA. There is no `.replicas()` on `postgres`, `redis`, or `bucket`. The IR field exists (default 1) for a later backend. `replicas > 1` in JSON is rejected: `local backend has no HA`. Plan treats size and bind changes as updates.
 
 `.bind(Bind::Localhost)` (default) or `.bind(Bind::All)` (`0.0.0.0`) is who can reach the **published** port. In-stack traffic still uses the private network.
 
@@ -98,9 +98,9 @@ Required Docker provision on GitHub-hosted `ubuntu-latest`. Docker is not disabl
 
 1. `cargo test --workspace`
 2. `cargo run -p infra -- --dir examples/infra apply` — must exit 0, state `applied`
-3. Health checks: containers running, Postgres accepts connections, Redis PING
+3. Health checks: containers running, Postgres accepts connections, Redis PING, named object-store bucket exists (not just TCP)
 4. `tofy run` can read `TOFY_APPDB_URI`
-5. `tofy destroy` and containers are gone
+5. `tofy destroy` and containers plus the stack network are gone
 
 If Docker is missing, the job **fails**. It does not skip. It does not treat “emitted compose, exit 1” as success.
 

@@ -19,7 +19,7 @@ pub struct Cli {
     #[arg(long, global = true, default_value = ".")]
     pub dir: PathBuf,
 
-    /// Already-emitted spec JSON (or a YAML import). Skips compiling a Rust stack.
+    /// Already-emitted spec JSON. Skips compiling a Rust stack.
     #[arg(long, global = true)]
     pub spec: Option<PathBuf>,
 
@@ -56,27 +56,35 @@ impl Cmd {
     }
 }
 
+/// What `Stack::apply` did. Only [`DeclaredOutcome::Applied`] may become `Stack<Applied>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredOutcome {
+    Applied,
+    Finished,
+}
+
 pub fn run() -> Result<()> {
-    run_inner(None)
+    dispatch(None).map(|_| ())
 }
 
-pub fn run_with_project(project: Project) -> Result<()> {
-    run_inner(Some(project))
+pub fn run_declared(project: Project) -> Result<DeclaredOutcome> {
+    dispatch(Some(project))
 }
 
-fn run_inner(declared: Option<Project>) -> Result<()> {
+fn dispatch(declared: Option<Project>) -> Result<DeclaredOutcome> {
     let cli = Cli::parse();
     let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
     let cmd = Cmd::or_apply(cli.cmd.clone());
 
     if declared.is_none() && cli.spec.is_none() && is_declaration_crate(&root) {
-        return forward_to_declaration(&root, &cli, &cmd);
+        forward_to_declaration(&root, &cli, &cmd)?;
+        return Ok(DeclaredOutcome::Finished);
     }
 
     match cmd {
         Cmd::Destroy => {
             print!("{}", engine::destroy(&root)?);
-            Ok(())
+            Ok(DeclaredOutcome::Finished)
         }
         Cmd::Output { json } => {
             let map = outputs::load(&root)?;
@@ -88,26 +96,26 @@ fn run_inner(declared: Option<Project>) -> Result<()> {
             } else {
                 print!("{}", outputs::format_public(&map));
             }
-            Ok(())
+            Ok(DeclaredOutcome::Finished)
         }
-        Cmd::Run { args } => run_command(&root, &args),
-        Cmd::Plan | Cmd::Apply | Cmd::Emit => {
+        Cmd::Run { args } => {
+            run_command(&root, &args)?;
+            Ok(DeclaredOutcome::Finished)
+        }
+        Cmd::Plan => {
             let spec = load_spec(&root, cli.spec.as_ref(), declared)?;
-            match cmd {
-                Cmd::Plan => {
-                    print!("{}", engine::plan_text(&root, &spec)?);
-                    Ok(())
-                }
-                Cmd::Apply => {
-                    print!("{}", engine::apply(&root, &spec)?);
-                    Ok(())
-                }
-                Cmd::Emit => {
-                    print!("{}", engine::emit(&root, &spec)?);
-                    Ok(())
-                }
-                _ => unreachable!(),
-            }
+            print!("{}", engine::plan_text(&root, &spec)?);
+            Ok(DeclaredOutcome::Finished)
+        }
+        Cmd::Emit => {
+            let spec = load_spec(&root, cli.spec.as_ref(), declared)?;
+            print!("{}", engine::emit(&root, &spec)?);
+            Ok(DeclaredOutcome::Finished)
+        }
+        Cmd::Apply => {
+            let spec = load_spec(&root, cli.spec.as_ref(), declared)?;
+            print!("{}", engine::apply(&root, &spec)?);
+            Ok(DeclaredOutcome::Applied)
         }
     }
 }
@@ -124,16 +132,12 @@ fn load_spec(
         project.validate()?;
         return Ok(project);
     }
-    let yaml = root.join("tofy.yaml");
-    if yaml.exists() {
-        return load_spec_file(&yaml);
-    }
     let json = root.join(".tofy").join("spec.json");
     if json.exists() {
         return Ok(Project::load_json(&json)?);
     }
     Err(Error::Spec(tofy_spec::SpecError::Validation(format!(
-        "no stack declaration, spec JSON, or tofy.yaml in {}",
+        "no stack declaration or spec JSON in {}",
         root.display()
     ))))
 }
@@ -145,13 +149,11 @@ pub fn load_spec_file(path: &Path) -> Result<Project> {
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "yaml" || ext == "yml" {
-        let raw = std::fs::read_to_string(path)?;
-        let spec: Project = serde_yaml::from_str(&raw)?;
-        spec.validate()?;
-        Ok(spec)
-    } else {
-        Ok(Project::load_json(path)?)
+        return Err(Error::Usage(
+            "spec must be JSON IR (`--spec spec.json`); yaml is not a write path".into(),
+        ));
     }
+    Ok(Project::load_json(path)?)
 }
 
 fn is_declaration_crate(dir: &Path) -> bool {
@@ -238,23 +240,46 @@ pub(crate) fn run_command(root: &Path, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
-    fn yaml_imports_to_same_ir() {
+    fn spec_json_loads() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tofy.yaml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(
-            b"project: demo\nbackend: local\nresources:\n  - name: appdb\n    type: postgres\n    version: \"16\"\n    port: 5433\n",
+        let path = dir.path().join("spec.json");
+        std::fs::write(
+            &path,
+            r#"{"project":"demo","resources":[{"name":"appdb","type":"postgres"}]}"#,
         )
         .unwrap();
         let spec = load_spec_file(&path).unwrap();
         assert_eq!(spec.project, "demo");
-        assert_eq!(spec.resources.len(), 1);
         assert_eq!(spec.resources[0].name, "appdb");
-        let json = spec.to_json_pretty().unwrap();
-        let again = Project::from_json_str(&json).unwrap();
-        assert_eq!(spec, again);
+    }
+
+    #[test]
+    fn spec_flag_rejects_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tofy.yaml");
+        std::fs::write(&path, "project: demo\nresources: []\n").unwrap();
+        let err = load_spec_file(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("JSON"), "{msg}");
+        assert!(!msg.contains("add tofy.yaml"), "{msg}");
+    }
+
+    #[test]
+    fn does_not_autoload_tofy_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tofy.yaml"),
+            "project: demo\nresources: []\n",
+        )
+        .unwrap();
+        let err = load_spec(dir.path(), None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("tofy.yaml"), "{msg}");
+        assert!(
+            msg.contains("spec JSON") || msg.contains("stack declaration"),
+            "{msg}"
+        );
     }
 }

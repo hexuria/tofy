@@ -17,10 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "=4.5.32", features = ["derive"] }
+hex = "=0.4.3"
+hmac = "=0.12.1"
 rand = "=0.8.5"
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9"
+sha2 = "=0.10.8"
 thiserror.workspace = true
 tofy-macros.workspace = true
 tofy-spec.workspace = true

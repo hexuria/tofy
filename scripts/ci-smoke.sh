@@ -69,6 +69,10 @@ need = [
     "TOFY_APPDB_PORT",
     "TOFY_CACHE_PORT",
     "TOFY_UPLOADS_PORT",
+    "TOFY_UPLOADS_BUCKET",
+    "TOFY_UPLOADS_ENDPOINT",
+    "TOFY_UPLOADS_ACCESS_KEY",
+    "TOFY_UPLOADS_SECRET_KEY",
     "TOFY_NETWORK",
     "TOFY_APPDB_URI",
 ]
@@ -79,7 +83,10 @@ for key in need:
     print(f"{key}={shlex.quote(str(data[key]))}")
 PY
 )"
-echo "TOFY_APPDB_PORT=$TOFY_APPDB_PORT TOFY_CACHE_PORT=$TOFY_CACHE_PORT TOFY_UPLOADS_PORT=$TOFY_UPLOADS_PORT TOFY_NETWORK=$TOFY_NETWORK"
+export TOFY_APPDB_PORT TOFY_CACHE_PORT TOFY_UPLOADS_PORT \
+  TOFY_UPLOADS_BUCKET TOFY_UPLOADS_ENDPOINT TOFY_UPLOADS_ACCESS_KEY TOFY_UPLOADS_SECRET_KEY \
+  TOFY_NETWORK TOFY_APPDB_URI
+echo "TOFY_APPDB_PORT=$TOFY_APPDB_PORT TOFY_CACHE_PORT=$TOFY_CACHE_PORT TOFY_UPLOADS_PORT=$TOFY_UPLOADS_PORT TOFY_UPLOADS_BUCKET=$TOFY_UPLOADS_BUCKET TOFY_NETWORK=$TOFY_NETWORK"
 
 echo "== containers are running =="
 running_names="$(docker ps --format '{{.Names}}')"
@@ -151,6 +158,62 @@ for label, port in (
 ):
     wait_tcp(port)
     print(f"tcp 127.0.0.1:{port} ({label}) ok")
+PY
+
+echo "== object-store bucket exists =="
+python3 - <<'PY'
+import datetime, hashlib, hmac, http.client, os, sys
+from urllib.parse import urlparse
+
+bucket = os.environ["TOFY_UPLOADS_BUCKET"]
+endpoint = os.environ["TOFY_UPLOADS_ENDPOINT"]
+access = os.environ["TOFY_UPLOADS_ACCESS_KEY"]
+secret = os.environ["TOFY_UPLOADS_SECRET_KEY"]
+if bucket != "uploads":
+    sys.exit(f"TOFY_UPLOADS_BUCKET={bucket!r}, expected 'uploads'")
+
+parsed = urlparse(endpoint)
+host = parsed.netloc
+path = f"/{bucket}"
+now = datetime.datetime.utcnow()
+amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+datestamp = now.strftime("%Y%m%d")
+region = "us-east-1"
+payload = hashlib.sha256(b"").hexdigest()
+canonical_headers = f"host:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{amz_date}\n"
+signed_headers = "host;x-amz-content-sha256;x-amz-date"
+canonical = f"HEAD\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload}"
+scope = f"{datestamp}/{region}/s3/aws4_request"
+string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
+
+def sign(key, msg):
+    return hmac.new(key, msg.encode() if isinstance(msg, str) else msg, hashlib.sha256).digest()
+
+k = sign(("AWS4" + secret).encode(), datestamp)
+k = sign(k, region)
+k = sign(k, "s3")
+k = sign(k, "aws4_request")
+sig = hmac.new(k, string_to_sign.encode(), hashlib.sha256).hexdigest()
+auth = (
+    f"AWS4-HMAC-SHA256 Credential={access}/{scope}, "
+    f"SignedHeaders={signed_headers}, Signature={sig}"
+)
+conn = http.client.HTTPConnection(host, timeout=5)
+conn.request(
+    "HEAD",
+    path,
+    headers={
+        "Host": host,
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": payload,
+        "Authorization": auth,
+    },
+)
+resp = conn.getresponse()
+resp.read()
+if resp.status not in (200, 204):
+    sys.exit(f"HEAD {endpoint}{path} -> {resp.status} (bucket missing?)")
+print(f"bucket {bucket} exists at {endpoint}")
 PY
 
 echo "== tofy run injects TOFY_APPDB_URI =="

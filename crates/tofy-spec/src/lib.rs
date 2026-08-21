@@ -1,7 +1,6 @@
 //! Language-agnostic resource spec (IR) for tofy.
 //!
-//! Rust builders, YAML importers, and other frontends all emit this shape.
-//! The engine consumes JSON.
+//! Rust builders and other frontends emit this shape. The engine consumes JSON.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -282,10 +281,11 @@ impl Project {
                     r.name
                 )));
             }
-            if r.kind == Kind::Postgres && r.replicas > 1 {
-                return Err(SpecError::Validation(
-                    "local backend has no HA: postgres replicas must be 1".into(),
-                ));
+            if r.replicas > 1 {
+                return Err(SpecError::Validation(format!(
+                    "local backend has no HA: {} replicas must be 1",
+                    r.kind
+                )));
             }
         }
         Ok(())
@@ -467,7 +467,7 @@ mod tests {
                 "project": "demo",
                 "resources": [
                     {"name": "appdb", "type": "postgres", "size": "medium", "bind": "0.0.0.0"},
-                    {"name": "cache", "type": "redis", "replicas": 2, "size": "large"}
+                    {"name": "cache", "type": "redis", "size": "large"}
                 ]
             }"#,
         )
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(spec.resources[0].bind, Bind::All);
         assert_eq!(spec.resources[0].replicas, 1);
         assert_eq!(spec.resources[1].size, Size::Large);
-        assert_eq!(spec.resources[1].replicas, 2);
+        assert_eq!(spec.resources[1].replicas, 1);
         assert_eq!(spec.docker_network(), "tofy-demo");
         assert_eq!(internal_host("appdb"), "appdb");
     }
@@ -494,15 +494,17 @@ mod tests {
     }
 
     #[test]
-    fn postgres_replicas_rejected() {
-        let err = Project::from_json_str(
-            r#"{
-                "project": "demo",
-                "resources": [{"name": "appdb", "type": "postgres", "replicas": 2}]
-            }"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("local backend has no HA"));
+    fn local_backend_rejects_replicas() {
+        for typ in ["postgres", "redis", "bucket"] {
+            let err = Project::from_json_str(&format!(
+                r#"{{"project":"demo","resources":[{{"name":"x","type":"{typ}","replicas":2}}]}}"#
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("local backend has no HA"),
+                "{typ}: {err}"
+            );
+        }
     }
 
     #[test]

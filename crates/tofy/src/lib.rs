@@ -14,6 +14,7 @@ pub mod lock;
 pub mod outputs;
 pub mod prelude;
 pub mod rt;
+pub mod s3;
 pub mod state;
 
 pub use error::{Error, Result};

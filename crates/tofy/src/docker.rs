@@ -127,25 +127,16 @@ fn remove_labeled(project: &str, resource: &str) -> Result<()> {
 pub fn start_resource(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
     ensure_network(&spec.project)?;
     remove_labeled(&spec.project, &r.name)?;
-    let replicas = r.replicas_or_default();
-    for i in 0..replicas {
-        start_one(spec, r, rs, i)?;
-    }
-    if r.kind == Kind::Postgres {
-        wait_for_postgres(&replica_container(&spec.project, &r.name, 0), rs.port)?;
-    }
+    start_one(spec, r, rs)?;
+    ready_resource(r, rs, &replica_container(&spec.project, &r.name, 0))?;
     Ok(())
 }
 
-fn start_one(spec: &Project, r: &Resource, rs: &ResourceState, index: u32) -> Result<()> {
-    let name = replica_container(&spec.project, &r.name, index);
-    let vol = replica_volume(&spec.project, &r.name, index);
+fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
+    let name = replica_container(&spec.project, &r.name, 0);
+    let vol = replica_volume(&spec.project, &r.name, 0);
     let net = docker_network(&spec.project);
-    let hostname = if index == 0 {
-        r.name.clone()
-    } else {
-        format!("{}-{}", r.name, index + 1)
-    };
+    let hostname = r.name.clone();
 
     if matches!(r.kind, Kind::Postgres | Kind::Bucket) {
         let mut vc = Command::new("docker");
@@ -178,17 +169,11 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState, index: u32) -> Re
         "--label",
         &format!("tofy.resource={}", r.name),
         "--label",
-        &format!("tofy.replica={}", index + 1),
+        "tofy.replica=1",
     ]);
-    if index > 0 {
-        cmd.args(["--network-alias", &hostname]);
-    }
-
-    if index == 0 {
-        let host_port = rs.port;
-        let internal = r.kind.internal_port();
-        cmd.args(["-p", &format!("{}:{host_port}:{internal}", r.bind.as_ip())]);
-    }
+    let host_port = rs.port;
+    let internal = r.kind.internal_port();
+    cmd.args(["-p", &format!("{}:{host_port}:{internal}", r.bind.as_ip())]);
 
     match r.kind {
         Kind::Postgres => {
@@ -233,27 +218,37 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState, index: u32) -> Re
 
 pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
     ensure_network(&spec.project)?;
-    let replicas = r.replicas_or_default();
-    for i in 0..replicas {
-        let name = replica_container(&spec.project, &r.name, i);
-        if container_running(&name) {
-            continue;
-        }
+    let name = replica_container(&spec.project, &r.name, 0);
+    if !container_running(&name) {
         if container_exists(&name) {
             let mut cmd = Command::new("docker");
             cmd.args(["start", &name]);
             run_checked(cmd)?;
-            if r.kind == Kind::Postgres && i == 0 {
-                wait_for_postgres(&name, rs.port)?;
-            }
         } else {
-            start_one(spec, r, rs, i)?;
-            if r.kind == Kind::Postgres && i == 0 {
-                wait_for_postgres(&name, rs.port)?;
-            }
+            start_one(spec, r, rs)?;
         }
     }
+    ready_resource(r, rs, &name)?;
     Ok(())
+}
+
+fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<()> {
+    match r.kind {
+        Kind::Postgres => wait_for_postgres(container, rs.port),
+        Kind::Bucket => {
+            crate::s3::wait_for_object_store(rs.port)?;
+            let access = rs
+                .outputs
+                .get("access_key")
+                .ok_or_else(|| Error::Engine("bucket access_key missing from state".into()))?;
+            let secret = rs
+                .outputs
+                .get("secret_key")
+                .ok_or_else(|| Error::Engine("bucket secret_key missing from state".into()))?;
+            crate::s3::ensure_bucket(rs.port, access, secret, &r.name)
+        }
+        Kind::Redis => Ok(()),
+    }
 }
 
 pub fn destroy_resource(project: &str, name: &str, replicas: u32) -> Result<()> {

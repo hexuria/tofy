@@ -1,0 +1,5 @@
+error[E0599]: no method named `replicas` found for struct `tofy::builder::Bucket` in the current scope
+ --> tests/fail/bucket_replicas.rs:4:25
+  |
+4 |     let _ = bucket("x").replicas(2);
+  |                         ^^^^^^^^ method not found in `Bucket<Open>`

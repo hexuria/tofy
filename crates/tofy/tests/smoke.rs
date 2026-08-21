@@ -44,6 +44,10 @@ fn smoke_apply_example_if_docker() {
     assert!(outs.contains_key("TOFY_APPDB_PASSWORD"));
     assert!(outs.contains_key("TOFY_CACHE_URI"));
     assert!(outs.contains_key("TOFY_UPLOADS_SECRET_KEY"));
+    assert_eq!(
+        outs.get("TOFY_UPLOADS_BUCKET").map(String::as_str),
+        Some("uploads")
+    );
     let password = outs["TOFY_APPDB_PASSWORD"].clone();
     assert_ne!(password, "tofy-tofy-smoke-appdb");
     assert!(!password.starts_with("tofy-"));

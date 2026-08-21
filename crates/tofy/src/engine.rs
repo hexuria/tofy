@@ -301,18 +301,37 @@ mod tests {
     }
 
     #[test]
-    fn plan_shows_size_and_replica_updates() {
+    fn plan_shows_size_update() {
         let current_spec = spec(&[("cache", Kind::Redis, None)]);
         let current = state_from(&current_spec);
         let mut desired = spec(&[("cache", Kind::Redis, None)]);
         desired.resources[0].size = tofy_spec::Size::Large;
-        desired.resources[0].replicas = 2;
         let actions = plan(&desired, &current);
         let text = format_actions(&actions);
         assert!(text.contains("~ update  cache"), "{text}");
         assert!(text.contains("size"), "{text}");
-        assert!(text.contains("replicas"), "{text}");
         assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_does_not_mark_resources_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(&[
+            ("appdb", Kind::Postgres, Some(5433)),
+            ("cache", Kind::Redis, None),
+            ("uploads", Kind::Bucket, None),
+        ]);
+        let text = plan_text(dir.path(), &spec).unwrap();
+        assert!(text.contains("+ create"), "{text}");
+        let current = State::load(dir.path()).unwrap();
+        assert!(
+            current
+                .resources
+                .values()
+                .all(|r| r.status != crate::state::Status::Applied),
+            "plan must not mark resources Applied"
+        );
+        assert!(!dir.path().join(".tofy").join("outputs.env").exists());
     }
 
     #[test]
