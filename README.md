@@ -76,6 +76,10 @@ Secrets (passwords, keys, URIs that embed them) are generated once, stored in `.
 
 `.tofy/` is gitignored. Do not commit `state.json` or `outputs.env`.
 
+## CI
+
+GitHub Actions (`ubuntu-latest` + Docker) runs `cargo test`, then really applies `examples/infra`: containers up, Postgres and Redis accept connections, `tofy run` sees `TOFY_APPDB_URI`, destroy removes the stack. If Docker is missing the job **fails**. It does not skip.
+
 ## What this is not
 
 **Not Shuttle.** Shuttle's macros provision on Shuttle's cloud. tofy declarations are desired state. You apply them on your machine (Docker today, OpenTofu later). The process that runs your app only reads env.

@@ -22,6 +22,7 @@ Rust is the written source. Builders and `#[tofy::main]` emit a language-agnosti
 - Wait until Postgres accepts connections
 - Missing Docker: emit artifacts, exit non-zero, do not claim Applied
 - Destroy tears down containers and the stack network, clears state (keeps emitted `main.tf.json`)
+- Required CI: GitHub-hosted ubuntu-latest with Docker, `cargo test`, real apply, health checks, `tofy run`, destroy. The job fails if Docker is missing.
 
 No AWS RDS, VPC, or Multi-AZ. OpenTofu is not the apply engine yet.
 
@@ -36,8 +37,7 @@ A real OpenTofu backend, not a compose wrapper that happens to write `tf.json`.
 - Keep the IR stable so the Rust frontend does not change
 - Size tokens map to instance class; replicas stay attributes, not new types
 
-## Phase 3 — CI and drift
+## Phase 3 — drift
 
-- CI workflow: `cargo test`, and a smoke apply when Docker is available
 - Drift: refresh live containers vs state, show a plan when reality diverged
-- Fail apply when another process holds the lock (already in phase 1) and surface lock / drift in CI
+- Surface lock / drift in CI (apply lock is already phase 1; provision CI is phase 1)
