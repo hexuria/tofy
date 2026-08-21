@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::mem::ManuallyDrop;
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -8,8 +9,12 @@ use crate::error::{Error, Result};
 /// Implemented with `flock(LOCK_EX | LOCK_NB)` so a second apply in the same
 /// directory fails with [`Error::Locked`], and so a crash or kill cannot leave
 /// a permanent lock (the kernel releases the flock when the process dies).
+///
+/// `flock` is per open-file-description. A failed acquire must close that fd,
+/// and [`Drop`] must `LOCK_UN` then close so a later acquire in the same
+/// process can succeed.
 pub struct Lock {
-    _file: File,
+    file: ManuallyDrop<File>,
 }
 
 impl Lock {
@@ -22,8 +27,25 @@ impl Lock {
             .write(true)
             .create(true)
             .open(&path)?;
-        try_lock_exclusive(&file)?;
-        Ok(Self { _file: file })
+        if let Err(e) = try_lock_exclusive(&file) {
+            // Never leave a half-used fd open. LOCK_UN is a no-op if this
+            // description never held the lock.
+            unlock(&file);
+            drop(file);
+            return Err(e);
+        }
+        Ok(Self {
+            file: ManuallyDrop::new(file),
+        })
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        unlock(&self.file);
+        unsafe {
+            ManuallyDrop::drop(&mut self.file);
+        }
     }
 }
 
@@ -41,12 +63,21 @@ fn try_lock_exclusive(file: &File) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn unlock(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
 #[cfg(not(unix))]
 fn try_lock_exclusive(_file: &File) -> Result<()> {
     Err(Error::Engine(
         "apply lock requires an exclusive OS file lock (flock)".into(),
     ))
 }
+
+#[cfg(not(unix))]
+fn unlock(_file: &File) {}
 
 #[cfg(test)]
 mod tests {
@@ -60,6 +91,16 @@ mod tests {
         assert!(matches!(second, Err(Error::Locked)));
         drop(first);
         Lock::acquire(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn two_failed_acquires_then_drop_can_reacquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Lock::acquire(dir.path()).unwrap();
+        assert!(matches!(Lock::acquire(dir.path()), Err(Error::Locked)));
+        assert!(matches!(Lock::acquire(dir.path()), Err(Error::Locked)));
+        drop(first);
+        Lock::acquire(dir.path()).expect("failed acquires must not leak a flock fd");
     }
 
     #[cfg(unix)]

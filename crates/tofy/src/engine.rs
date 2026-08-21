@@ -623,7 +623,9 @@ mod tests {
         assert!(!err.to_string().contains("Destroyed"));
         assert!(!err.to_string().contains("Applied"));
         drop(held);
-        // Lock is free. Apply may still fail if Docker is missing — that is not Locked.
+        // Same-process reacquire must work after Drop (LOCK_UN + close).
+        drop(Lock::acquire(dir.path()).expect("lock leaked after drop"));
+        // Apply may still fail if Docker is missing — that is not Locked.
         match apply(dir.path(), &spec) {
             Ok(_) => {
                 let _ = destroy(dir.path());
