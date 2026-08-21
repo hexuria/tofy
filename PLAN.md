@@ -37,7 +37,7 @@ A real OpenTofu backend. `Backend::Tofu` is no longer a dead enum. When the spec
 - Phase 1 `scripts/ci-smoke.sh` stays the local Docker job and still requires Docker
 - No RDS, Multi-AZ, VPC, subnets, security groups, load balancers, IAM, or autoscaler
 
-## Phase 3 — this PR
+## Phase 3 — merged
 
 Drift, a real apply lock, and CI that fails if either is broken.
 
@@ -49,6 +49,11 @@ Drift, a real apply lock, and CI that fails if either is broken.
 - These docs: `README.md`, this file, `docs/api.md`
 
 No AWS, no new kinds, no PgPool.
+
+## Polish
+
+- Honest `tofy plan` on `Backend::Tofu`: run the OpenTofu engine plan against the emitted 0600 `.tofy/main.tf.json` (init if needed). Print that plan. Redact secrets. Missing tofu errors and does not print `No changes.` as if it planned. Plan does not mark resources Applied. Local plan stays the live-refresh planner — do not replace it with tofu.
+- `examples/infra-tofu` is `stack("demotofu")` with host ports 15433 / 16379 / 19000 so it can coexist with `examples/infra` (`demo` / 5433 / 6379 / 9000). Containers are `tofy-demotofu-*`. Same three resources and `.backend(Backend::Tofu)`.
 
 ## Later
 

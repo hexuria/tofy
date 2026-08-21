@@ -23,8 +23,10 @@ fn main() {
 That default is the local Docker engine. The same resource lines select OpenTofu with a typestate-legal selector on `Stack<Empty>`:
 
 ```rust
-stack("demo").backend(Backend::Tofu).add(db).add(cache).add(files).apply();
+stack("demotofu").backend(Backend::Tofu).add(db).add(cache).add(files).apply();
 ```
+
+`examples/infra` stays `stack("demo")` on 5433 / 6379 / 9000. `examples/infra-tofu` is `stack("demotofu")` with host ports 15433 / 16379 / 19000 so both can run on one machine.
 
 `postgres()` is a declaration, not a live connection. Builders are `Foo<S>` with `PhantomData` — illegal methods do not exist on that impl. `stack("demo")` cannot `apply` until you `add` a resource. After `apply()` you cannot `add` again. See [docs/api.md](docs/api.md).
 
@@ -43,7 +45,7 @@ Apply writes `spec.json` (IR, no secrets). The local backend does **not** write 
 
 If Docker is missing on the local backend: spec JSON may be written, the process exits non-zero, and apply does **not** claim Applied. Destroy also requires Docker: it errors and leaves state alone. It does not print Destroyed.
 
-If the spec backend is Tofu and the OpenTofu engine is missing: apply and destroy error, do not print Applied / Destroyed, and destroy leaves state alone. The message is that the OpenTofu engine is required for this backend — not “go run `tofu apply`.”
+If the spec backend is Tofu and the OpenTofu engine is missing: plan, apply, and destroy error; plan does not print `No changes.`; apply / destroy do not print Applied / Destroyed; destroy leaves state alone. The message is that the OpenTofu engine is required for this backend — not “go run `tofu apply`” or “go run `tofu plan`.”
 
 ## Commands
 
@@ -57,9 +59,11 @@ cargo run -p infra -- --dir examples/infra destroy
 
 # same command, OpenTofu engine (Backend::Tofu in the crate)
 cargo run -p infra-tofu -- --dir examples/infra-tofu
+cargo run -p infra-tofu -- --dir examples/infra-tofu plan
 
 # CLI pointed at that crate
 tofy --dir examples/infra plan
+tofy --dir examples/infra-tofu plan
 tofy --dir examples/infra apply
 tofy --dir examples/infra output
 tofy --dir examples/infra run -- node app.js
@@ -70,7 +74,7 @@ tofy --dir examples/infra destroy
 tofy --dir . apply --spec spec.json
 ```
 
-`tofy plan` refreshes live containers against `.tofy/state.json` and redacts passwords. A stopped or remapped container is a change, with a reason (`not running`, `port changed`). `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state. If Docker is missing (local backend), or the OpenTofu engine is missing (Tofu backend), destroy errors and does not clear state. A second apply or destroy in the same directory while one is running is `Locked` (exclusive `flock`; a crash does not leave a permanent lock).
+`tofy plan` on the local backend refreshes live containers against `.tofy/state.json` and redacts passwords. A stopped or remapped container is a change, with a reason (`not running`, `port changed`). On `Backend::Tofu`, `tofy plan` runs the OpenTofu engine plan (`tofu plan`) against the emitted 0600 `.tofy/main.tf.json` (init if needed) and prints that plan, with secrets redacted. Missing tofu is an error — it does not print `No changes.` as if it planned. Plan does not mark resources Applied. `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down containers and clears state. If Docker is missing (local backend), or the OpenTofu engine is missing (Tofu backend), destroy errors and does not clear state. A second apply or destroy in the same directory while one is running is `Locked` (exclusive `flock`; a crash does not leave a permanent lock).
 
 ## Env vars
 
@@ -109,7 +113,7 @@ Two required jobs on GitHub-hosted `ubuntu-latest`. rustc is pinned to 1.83 (`ru
 
 **Local Docker** (`scripts/ci-smoke.sh`): `cargo test --workspace`, then `cargo run -p infra` (default `Backend::Local`). Docker is not disabled. Missing Docker **fails**.
 
-**OpenTofu engine** (`scripts/ci-smoke-tofu.sh`): installs OpenTofu, then `cargo run -p infra-tofu` (`stack("demo").backend(Backend::Tofu)…`). Missing Docker or missing tofu **fails**.
+**OpenTofu engine** (`scripts/ci-smoke-tofu.sh`): installs OpenTofu, then `cargo run -p infra-tofu` (`stack("demotofu").backend(Backend::Tofu)…` on 15433 / 16379 / 19000). `tofy plan` must print the OpenTofu engine plan, not only the house `Plan:` / `+ create` format. Missing Docker or missing tofu **fails**.
 
 Both jobs:
 
@@ -127,7 +131,7 @@ Both jobs:
 
 **Not Compose.** Compose is a container file format. tofy is a control language plus a planner. The local backend starts containers with Docker. Apply does not write a compose file.
 
-**Not a tofu CLI wrapper.** OpenTofu is an optional engine ([PLAN.md](PLAN.md) phase 2). The product is the Rust frontend and the IR. You run `tofy apply`, not `tofu apply`.
+**Not a tofu CLI wrapper.** OpenTofu is an optional engine ([PLAN.md](PLAN.md) phase 2). The product is the Rust frontend and the IR. You run `tofy apply` / `tofy plan`, not `tofu apply` / `tofu plan`.
 
 ## Repo
 

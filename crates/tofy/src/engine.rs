@@ -201,8 +201,16 @@ pub fn format_actions(actions: &[Action]) -> String {
 pub fn plan_text(root: &Path, spec: &Project) -> Result<String> {
     spec.validate()?;
     let current = State::load(root)?;
-    let live = observe_live(spec);
-    Ok(format_actions(&plan_with_live(spec, &current, &live)))
+    match spec.backend {
+        Backend::Local => {
+            let live = observe_live(spec);
+            Ok(format_actions(&plan_with_live(spec, &current, &live)))
+        }
+        Backend::Tofu => {
+            let next = prepare_state(spec, &current);
+            tofu::plan(root, spec, &next)
+        }
+    }
 }
 
 pub fn apply(root: &Path, spec: &Project) -> Result<String> {
@@ -756,5 +764,70 @@ mod tests {
         let spec = spec(&[("cache", Kind::Redis, None)]);
         let _ = apply(dir.path(), &spec);
         assert!(!dir.path().join(".tofy").join("main.tf.json").exists());
+    }
+
+    #[test]
+    fn tofu_plan_without_engine_errors_and_does_not_claim_no_changes() {
+        if tofu::available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spec = tofu_spec(&[
+            ("appdb", Kind::Postgres, Some(15433)),
+            ("cache", Kind::Redis, Some(16379)),
+            ("uploads", Kind::Bucket, Some(19000)),
+        ]);
+        let err = plan_text(dir.path(), &spec).unwrap_err();
+        assert!(matches!(err, Error::PlanNeedsTofu), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("OpenTofu engine is required"), "{msg}");
+        assert!(msg.contains("did not plan"), "{msg}");
+        assert!(!msg.contains("No changes."));
+        assert!(!msg.contains("Applied"));
+        assert!(!msg.to_lowercase().contains("go run"));
+        assert!(!msg.contains("tofu plan"));
+        let loaded = State::load(dir.path()).unwrap();
+        assert!(
+            loaded
+                .resources
+                .values()
+                .all(|r| r.status != crate::state::Status::Applied),
+            "plan must not mark resources Applied"
+        );
+        assert!(!dir.path().join(".tofy").join("outputs.env").exists());
+        let main = dir.path().join(".tofy").join("main.tf.json");
+        assert!(main.exists(), "plan still emits the tofu config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&main).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn local_plan_stays_house_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(&[
+            ("appdb", Kind::Postgres, Some(5433)),
+            ("cache", Kind::Redis, None),
+            ("uploads", Kind::Bucket, None),
+        ]);
+        let text = plan_text(dir.path(), &spec).unwrap();
+        assert!(text.contains("Plan:"), "{text}");
+        assert!(text.contains("+ create  appdb  (postgres)"), "{text}");
+        assert!(
+            !text.contains("OpenTofu will perform"),
+            "local plan must not shell out to tofu: {text}"
+        );
+        assert!(
+            !text.contains("docker_container"),
+            "local plan must not print tofu resource addresses: {text}"
+        );
+        let current = State::load(dir.path()).unwrap();
+        assert!(current
+            .resources
+            .values()
+            .all(|r| r.status != crate::state::Status::Applied));
     }
 }

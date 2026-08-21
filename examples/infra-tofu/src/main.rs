@@ -4,12 +4,12 @@ use tofy::prelude::*;
 fn main() {
     let db = postgres("appdb")
         .version("16")
-        .port(5433)
+        .port(15433)
         .size(Size::Small)
         .bind(Bind::Localhost);
-    let cache = redis("cache");
-    let files = bucket("uploads");
-    stack("demo")
+    let cache = redis("cache").port(16379);
+    let files = bucket("uploads").port(19000);
+    stack("demotofu")
         .backend(Backend::Tofu)
         .add(db)
         .add(cache)
