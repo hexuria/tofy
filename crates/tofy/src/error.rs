@@ -14,6 +14,8 @@ pub enum Error {
     DestroyNeedsDocker,
     #[error("OpenTofu engine is required for this backend; did not apply.")]
     TofuMissing,
+    #[error("OpenTofu engine is required for this backend; did not plan.")]
+    PlanNeedsTofu,
     #[error(
         "OpenTofu engine is required for this backend; did not destroy. State left unchanged."
     )]

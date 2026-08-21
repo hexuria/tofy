@@ -1,5 +1,6 @@
-//! OpenTofu engine. `tofy apply` runs this when the spec backend is Tofu.
-//! The user-facing command stays `tofy apply` / `tofy destroy`.
+//! OpenTofu engine. `tofy apply` / `tofy plan` / `tofy destroy` run this when
+//! the spec backend is Tofu. The user-facing commands stay `tofy apply` /
+//! `tofy plan` / `tofy destroy` — never "go run tofu …".
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -33,6 +34,18 @@ pub fn apply(root: &Path, spec: &Project, state: &State) -> Result<()> {
     wait_ready(spec, state)
 }
 
+/// Emit `.tofy/main.tf.json` (0600), `tofu init` if needed, and return `tofu plan`.
+/// Does not persist Applied status. Missing tofu is an error, not "No changes."
+pub fn plan(root: &Path, spec: &Project, state: &State) -> Result<String> {
+    emit::write_tofu_config(root, spec, state)?;
+    if !available() {
+        return Err(Error::PlanNeedsTofu);
+    }
+    let secrets = secret_values(state);
+    run(root, &["init", "-input=false", "-no-color"], &secrets)?;
+    run_output(root, &["plan", "-input=false", "-no-color"], &secrets)
+}
+
 pub fn destroy(root: &Path, state: &State) -> Result<()> {
     let spec = state.as_project();
     emit::write_tofu_config(root, &spec, state)?;
@@ -60,6 +73,10 @@ fn wait_ready(spec: &Project, state: &State) -> Result<()> {
 }
 
 fn run(root: &Path, args: &[&str], secrets: &[String]) -> Result<()> {
+    run_output(root, args, secrets).map(|_| ())
+}
+
+fn run_output(root: &Path, args: &[&str], secrets: &[String]) -> Result<String> {
     let dir = root.join(".tofy");
     std::fs::create_dir_all(&dir)?;
     let mut cmd = Command::new("tofu");
@@ -72,18 +89,19 @@ fn run(root: &Path, args: &[&str], secrets: &[String]) -> Result<()> {
             "OpenTofu engine is required for this backend ({e})"
         ))
     })?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let redacted = redact(&combined, secrets);
     if !out.status.success() {
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
         return Err(Error::Engine(format!(
             "OpenTofu engine failed: {}",
-            truncate(&redact(&combined, secrets), 4000)
+            truncate(&redacted, 4000)
         )));
     }
-    Ok(())
+    Ok(redacted)
 }
 
 fn secret_values(state: &State) -> Vec<String> {

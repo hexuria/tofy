@@ -123,6 +123,24 @@ fn smoke_apply_tofu_if_available() {
     let root = tmp.path();
     let spec = tofu_demo_spec();
 
+    let planned = engine::plan_text(root, &spec).expect("tofu plan");
+    assert!(
+        looks_like_tofu_engine_plan(&planned),
+        "tofu-backend plan must run tofu plan, not the house format: {planned}"
+    );
+    assert!(!looks_like_house_plan_only(&planned), "{planned}");
+    assert!(!planned.contains("Applied."), "{planned}");
+    assert!(!planned.to_lowercase().contains("go run tofu"), "{planned}");
+    assert_plan_redacts_tf_secrets(root, &planned);
+    let after_plan = tofy::state::State::load(root).unwrap();
+    assert!(
+        after_plan
+            .resources
+            .values()
+            .all(|r| r.status != tofy::state::Status::Applied),
+        "plan must not mark resources Applied"
+    );
+
     let first = engine::apply(root, &spec).expect("tofu apply");
     assert!(first.contains("Applied."), "{first}");
     assert!(!first.to_lowercase().contains("go run tofu"));
@@ -163,14 +181,21 @@ fn smoke_apply_tofu_if_available() {
         "docker stop {cache}"
     );
     let drifted = engine::plan_text(root, &spec).expect("tofu plan after stop");
-    assert!(!drifted.contains("No changes."), "{drifted}");
     assert!(
-        drifted.contains("not running")
-            || drifted.contains("~ update")
-            || drifted.contains("+ create"),
-        "{drifted}"
+        looks_like_tofu_engine_plan(&drifted),
+        "tofu-backend drift plan must be tofu plan: {drifted}"
     );
-    assert!(!drifted.to_lowercase().contains("password"), "{drifted}");
+    assert!(!looks_like_house_plan_only(&drifted), "{drifted}");
+    assert!(
+        !is_tofu_no_changes(&drifted),
+        "tofu plan ignored a stopped container: {drifted}"
+    );
+    assert!(!drifted.contains("Applied."), "{drifted}");
+    assert_plan_redacts_tf_secrets(root, &drifted);
+    assert!(
+        !drifted.contains(&outs["TOFY_CACHE_PASSWORD"]),
+        "plan leaked cache password"
+    );
     let healed = engine::apply(root, &spec).expect("tofu heal drift");
     assert!(healed.contains("Applied."), "{healed}");
     assert!(!healed.to_lowercase().contains("go run tofu"), "{healed}");
@@ -182,4 +207,60 @@ fn smoke_apply_tofu_if_available() {
     let destroyed = engine::destroy(root).expect("tofu destroy");
     assert!(destroyed.contains("Destroyed"), "{destroyed}");
     assert!(!root.join(".tofy").join("outputs.env").exists());
+}
+
+fn looks_like_tofu_engine_plan(text: &str) -> bool {
+    text.contains("OpenTofu will perform")
+        || text.contains("OpenTofu used the selected providers")
+        || text.contains("Terraform will perform")
+        || text.contains("docker_container")
+        || text.contains(" to add,")
+        || text.contains(" to change,")
+        || text.contains(" to destroy")
+        || text.contains("No changes. Your infrastructure")
+}
+
+fn assert_plan_redacts_tf_secrets(root: &Path, plan: &str) {
+    let tf = std::fs::read_to_string(root.join(".tofy").join("main.tf.json"))
+        .expect("main.tf.json after tofu plan");
+    for prefix in [
+        "POSTGRES_PASSWORD=",
+        "MINIO_ROOT_PASSWORD=",
+        "MINIO_ROOT_USER=",
+    ] {
+        for (i, _) in tf.match_indices(prefix) {
+            let value: String = tf[i + prefix.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if value.len() >= 4 {
+                assert!(
+                    !plan.contains(&value),
+                    "plan leaked a secret from main.tf.json"
+                );
+            }
+        }
+    }
+    if let Some(i) = tf.find("--requirepass") {
+        let value: String = tf[i + "--requirepass".len()..]
+            .chars()
+            .skip_while(|c| !c.is_ascii_alphanumeric())
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if value.len() >= 4 {
+            assert!(
+                !plan.contains(&value),
+                "plan leaked the redis requirepass value"
+            );
+        }
+    }
+}
+
+fn looks_like_house_plan_only(text: &str) -> bool {
+    let house = text.contains("+ create  ") || text.trim() == "No changes.";
+    house && !looks_like_tofu_engine_plan(text)
+}
+
+fn is_tofu_no_changes(text: &str) -> bool {
+    text.contains("No changes. Your infrastructure") || text.trim() == "No changes."
 }

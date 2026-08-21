@@ -1,13 +1,41 @@
 #!/usr/bin/env bash
-# OpenTofu-backend smoke: apply examples/infra-tofu, probe published host ports, destroy.
+# OpenTofu-backend smoke: plan + apply examples/infra-tofu, probe published host ports, destroy.
 # Must fail if Docker or the OpenTofu engine is missing. Do not skip.
-# The user-facing command is `tofy apply`. Do not tell the user to run tofu themselves.
+# The user-facing commands are `tofy plan` / `tofy apply`. Do not tell the user to run tofu themselves.
+# Stack is `demotofu` (ports 15433 / 16379 / 19000) so it can coexist with examples/infra.
 set -euo pipefail
 
 ROOT="${TOFY_SMOKE_DIR:-examples/infra-tofu}"
 PKG="${TOFY_SMOKE_PKG:-infra-tofu}"
 BIN=(cargo run -q -p tofy -- --dir "$ROOT")
+CONTAINERS=(tofy-demotofu-appdb tofy-demotofu-cache tofy-demotofu-uploads)
 export TOFY_SMOKE_ROOT="$ROOT"
+
+assert_tofu_engine_plan() {
+  local log="$1"
+  if grep -qi "go run tofu" "$log"; then
+    echo "plan told the user to run tofu; that is not the product path"
+    cat "$log"
+    exit 1
+  fi
+  if grep -q "Applied." "$log"; then
+    echo "plan claimed Applied."
+    cat "$log"
+    exit 1
+  fi
+  # Must be the OpenTofu engine plan, not only the house "Plan: / + create" format.
+  if ! grep -qE 'OpenTofu will perform|OpenTofu used the selected providers|Terraform will perform|docker_container| to add,| to change,| to destroy|No changes\. Your infrastructure' "$log"; then
+    echo "plan did not run the OpenTofu engine (no tofu plan markers)"
+    cat "$log"
+    exit 1
+  fi
+  if grep -qE '\+ create  (appdb|cache|uploads)  \((postgres|redis|bucket)\)' "$log" \
+    && ! grep -qE 'OpenTofu|docker_container' "$log"; then
+    echo "plan is house format only; Backend::Tofu must print tofu plan"
+    cat "$log"
+    exit 1
+  fi
+}
 
 if ! docker info >/dev/null 2>&1; then
   echo "Docker is required for this smoke; refusing to treat emit-only as success."
@@ -19,6 +47,104 @@ if ! command -v tofu >/dev/null 2>&1; then
   exit 1
 fi
 tofu version
+
+echo "== plan (public path: cargo run -p $PKG plan, Backend::Tofu) =="
+set +e
+cargo run -p "$PKG" -- --dir "$ROOT" plan | tee /tmp/tofy-tofu-plan.log
+PLAN_EC=${PIPESTATUS[0]}
+set -e
+if grep -q "OpenTofu engine is required" /tmp/tofy-tofu-plan.log; then
+  echo "plan claimed OpenTofu engine is missing; CI must fail"
+  exit 1
+fi
+if [[ "$PLAN_EC" -ne 0 ]]; then
+  echo "plan exited $PLAN_EC"
+  exit "$PLAN_EC"
+fi
+assert_tofu_engine_plan /tmp/tofy-tofu-plan.log
+python3 - <<PY
+import json, stat, sys
+from pathlib import Path
+root = Path("$ROOT") / ".tofy"
+main = root / "main.tf.json"
+if not main.exists():
+    sys.exit("tofu plan did not write .tofy/main.tf.json")
+mode = stat.S_IMODE(main.stat().st_mode)
+if mode != 0o600:
+    sys.exit(f"main.tf.json mode={oct(mode)}, expected 0o600")
+state_path = root / "state.json"
+if state_path.exists():
+    state = json.loads(state_path.read_text())
+    for name, r in (state.get("resources") or {}).items():
+        if r.get("status") == "applied":
+            sys.exit(f"plan marked {name} Applied")
+text = Path("/tmp/tofy-tofu-plan.log").read_text()
+tf = json.loads(main.read_text())
+
+def walk(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+    elif isinstance(o, str) and o:
+        yield o
+
+secrets = []
+prev = None
+for s in walk(tf):
+    if "=" in s and any(s.startswith(p) for p in (
+        "POSTGRES_PASSWORD=", "MINIO_ROOT_PASSWORD=", "MINIO_ROOT_USER=",
+    )):
+        secrets.append(s.split("=", 1)[1])
+    if prev == "--requirepass":
+        secrets.append(s)
+    prev = s
+leaked = [s for s in secrets if len(s) >= 4 and s in text]
+if leaked:
+    sys.exit("plan printed a secret value from main.tf.json")
+print("tofu plan wrote main.tf.json mode 0600; did not mark Applied; secrets redacted")
+PY
+
+echo "== plan (CLI: tofy --dir $ROOT plan) =="
+set +e
+"${BIN[@]}" plan | tee /tmp/tofy-tofu-plan-cli.log
+PLAN_CLI_EC=${PIPESTATUS[0]}
+set -e
+if [[ "$PLAN_CLI_EC" -ne 0 ]]; then
+  echo "tofy --dir plan exited $PLAN_CLI_EC"
+  exit "$PLAN_CLI_EC"
+fi
+assert_tofu_engine_plan /tmp/tofy-tofu-plan-cli.log
+python3 - <<PY
+import json, sys
+from pathlib import Path
+text = Path("/tmp/tofy-tofu-plan-cli.log").read_text()
+tf = json.loads((Path("$ROOT") / ".tofy" / "main.tf.json").read_text())
+
+def walk(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+    elif isinstance(o, str) and o:
+        yield o
+
+secrets, prev = [], None
+for s in walk(tf):
+    if "=" in s and any(s.startswith(p) for p in (
+        "POSTGRES_PASSWORD=", "MINIO_ROOT_PASSWORD=", "MINIO_ROOT_USER=",
+    )):
+        secrets.append(s.split("=", 1)[1])
+    if prev == "--requirepass":
+        secrets.append(s)
+    prev = s
+if any(len(s) >= 4 and s in text for s in secrets):
+    sys.exit("CLI plan printed a secret value")
+PY
 
 echo "== apply (public path: cargo run -p $PKG, Backend::Tofu) =="
 set +e
@@ -122,7 +248,7 @@ echo "TOFY_APPDB_PORT=$TOFY_APPDB_PORT TOFY_CACHE_PORT=$TOFY_CACHE_PORT TOFY_UPL
 
 echo "== containers are running =="
 running_names="$(docker ps --format '{{.Names}}')"
-for name in tofy-demo-appdb tofy-demo-cache tofy-demo-uploads; do
+for name in "${CONTAINERS[@]}"; do
   if ! grep -qx "$name" <<<"$running_names"; then
     echo "container $name is not running"
     docker ps -a
@@ -261,9 +387,9 @@ if port and f"@127.0.0.1:{port}/" not in u:
 print("TOFY_APPDB_URI is set for the host")
 '
 
-echo "== drift: stop cache, plan must show a change =="
-if ! docker stop tofy-demo-cache >/dev/null; then
-  echo "failed to stop tofy-demo-cache"
+echo "== drift: stop cache, tofu plan must show a change =="
+if ! docker stop tofy-demotofu-cache >/dev/null; then
+  echo "failed to stop tofy-demotofu-cache"
   exit 1
 fi
 set +e
@@ -274,21 +400,14 @@ if [[ "$PLAN_EC" -ne 0 ]]; then
   echo "plan exited $PLAN_EC"
   exit "$PLAN_EC"
 fi
+assert_tofu_engine_plan /tmp/tofy-tofu-plan-drift.log
+if grep -F -- "$TOFY_CACHE_PASSWORD" /tmp/tofy-tofu-plan-drift.log; then
+  echo "drift plan leaked TOFY_CACHE_PASSWORD"
+  exit 1
+fi
 if grep -q "No changes." /tmp/tofy-tofu-plan-drift.log; then
-  echo "plan ignored a stopped container"
-  exit 1
-fi
-if ! grep -E "not running|~ update|\\+ create" /tmp/tofy-tofu-plan-drift.log; then
-  echo "plan did not explain drift"
+  echo "tofu plan ignored a stopped container"
   cat /tmp/tofy-tofu-plan-drift.log
-  exit 1
-fi
-if grep -qi password /tmp/tofy-tofu-plan-drift.log; then
-  echo "plan printed a password"
-  exit 1
-fi
-if grep -qi "go run tofu" /tmp/tofy-tofu-plan-drift.log; then
-  echo "plan told the user to run tofu"
   exit 1
 fi
 
@@ -313,16 +432,17 @@ if grep -qi "go run tofu" /tmp/tofy-tofu-heal.log; then
   echo "heal apply told the user to run tofu"
   exit 1
 fi
-if ! docker ps --format '{{.Names}}' | grep -qx tofy-demo-cache; then
-  echo "tofy-demo-cache is not running after tofu heal"
+if ! docker ps --format '{{.Names}}' | grep -qx tofy-demotofu-cache; then
+  echo "tofy-demotofu-cache is not running after tofu heal"
   docker ps -a
   exit 1
 fi
 set +e
 "${BIN[@]}" plan | tee /tmp/tofy-tofu-plan-healed.log
 set -e
+assert_tofu_engine_plan /tmp/tofy-tofu-plan-healed.log
 if ! grep -q "No changes." /tmp/tofy-tofu-plan-healed.log; then
-  echo "plan still shows drift after tofu apply"
+  echo "tofu plan still shows drift after tofu apply"
   cat /tmp/tofy-tofu-plan-healed.log
   exit 1
 fi
@@ -339,7 +459,7 @@ echo "== destroy =="
 
 echo "== containers and stack network are gone =="
 leftover_names="$(docker ps -a --format '{{.Names}}')"
-for name in tofy-demo-appdb tofy-demo-cache tofy-demo-uploads; do
+for name in "${CONTAINERS[@]}"; do
   if grep -qx "$name" <<<"$leftover_names"; then
     echo "container $name still exists after destroy"
     docker ps -a

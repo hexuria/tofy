@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Cmd {
-    /// Refresh live containers vs .tofy/state.json and print the plan
+    /// Local: live Docker vs state. Tofu: OpenTofu engine plan.
     Plan,
     /// Create, update, and delete resources
     Apply,

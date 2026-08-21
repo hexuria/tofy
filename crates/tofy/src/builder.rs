@@ -216,7 +216,8 @@ impl Stack<NonEmpty> {
         self
     }
 
-    /// Print the plan against `.tofy/state.json` and live containers. Consumes the stack.
+    /// Print the plan. Local: spec vs state and live Docker.
+    /// Tofu: OpenTofu engine plan against `.tofy/main.tf.json`.
     pub fn plan(self) {
         mark_stack_closed();
         let root = workdir();

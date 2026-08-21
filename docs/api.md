@@ -39,7 +39,7 @@ The local backend has no HA. `replicas` is not a method on any Open builder. If 
 
 `.apply()` on `Stack<NonEmpty>` calls `engine::apply` and only then returns `Stack<Applied>`. `cargo run -p infra` with no verb still applies.
 
-`tofy plan` (and `Stack::plan`) refresh live Docker containers against `.tofy/state.json`. Reality that diverged — not running, missing, wrong image / published port / bind / labels — shows as a create or update, with a reason. Apply heals that drift. Plan text does not print passwords.
+`tofy plan` (and `Stack::plan`) depend on the spec backend. Local: refresh live Docker containers against `.tofy/state.json`. Reality that diverged — not running, missing, wrong image / published port / bind / labels — shows as a create or update, with a reason. Apply heals that drift. Tofu: run the OpenTofu engine plan against `.tofy/main.tf.json` (mode `0600`). Missing tofu errors; it does not print `No changes.` Plan does not mark resources Applied. Secrets stay out of the printed plan.
 
 `cargo run -- plan` (and destroy / output / run / emit) still work: `apply()` sees the CLI verb, performs that verb, and **exits without returning Applied**. The type is not a lie.
 
@@ -68,4 +68,4 @@ After apply, other languages **do not** import tofy.
 
 The JSON IR (`Project` / `Resource` / `Kind` / `Backend` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
 
-When `backend` is `tofu`, apply runs the OpenTofu engine against an emitted docker-provider config under `.tofy/` (mode `0600` if it contains secrets). The user-facing command is still `tofy apply`, not `tofu`.
+When `backend` is `tofu`, apply and plan run the OpenTofu engine against an emitted docker-provider config under `.tofy/` (mode `0600` if it contains secrets). The user-facing commands are still `tofy apply` / `tofy plan`, not `tofu apply` / `tofu plan`. `examples/infra-tofu` uses `stack("demotofu")` and host ports 15433 / 16379 / 19000 so it does not collide with `examples/infra`.
