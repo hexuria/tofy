@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tofy_spec::{Kind, Project, Resource};
+use tofy_spec::{internal_host, Bind, Kind, Project, Resource, Size};
 
 use crate::error::Result;
 
@@ -22,7 +22,17 @@ pub struct ResourceState {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(default)]
+    pub size: Size,
+    #[serde(default)]
+    pub bind: Bind,
+    #[serde(default = "default_replicas")]
+    pub replicas: u32,
     pub outputs: BTreeMap<String, String>,
+}
+
+fn default_replicas() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -106,6 +116,9 @@ pub fn prepare_state(spec: &Project, current: &State) -> State {
                 image: docker_image(r),
                 port: r.port_or_default(),
                 version: Some(r.version_or_default().to_string()),
+                size: r.size,
+                bind: r.bind,
+                replicas: r.replicas_or_default(),
                 outputs: outputs_for(spec, r, have),
             },
         );
@@ -123,7 +136,12 @@ pub fn outputs_for(
 ) -> BTreeMap<String, String> {
     let _ = spec;
     let port = r.port_or_default();
+    let internal_port = r.kind.internal_port();
+    let in_host = internal_host(&r.name);
     let mut out = BTreeMap::new();
+    out.insert("bind".into(), r.bind.as_ip().to_string());
+    out.insert("size".into(), r.size.as_str().to_string());
+    out.insert("replicas".into(), r.replicas_or_default().to_string());
     match r.kind {
         Kind::Postgres => {
             let user = "tofy".to_string();
@@ -133,16 +151,28 @@ pub fn outputs_for(
                 "uri".into(),
                 format!("postgres://{user}:{password}@127.0.0.1:{port}/{database}"),
             );
+            out.insert(
+                "internal_uri".into(),
+                format!("postgres://{user}:{password}@{in_host}:{internal_port}/{database}"),
+            );
             out.insert("user".into(), user);
             out.insert("password".into(), password);
             out.insert("database".into(), database);
             out.insert("host".into(), "127.0.0.1".into());
             out.insert("port".into(), port.to_string());
+            out.insert("internal_host".into(), in_host.to_string());
+            out.insert("internal_port".into(), internal_port.to_string());
         }
         Kind::Redis => {
             out.insert("uri".into(), format!("redis://127.0.0.1:{port}"));
+            out.insert(
+                "internal_uri".into(),
+                format!("redis://{in_host}:{internal_port}"),
+            );
             out.insert("host".into(), "127.0.0.1".into());
             out.insert("port".into(), port.to_string());
+            out.insert("internal_host".into(), in_host.to_string());
+            out.insert("internal_port".into(), internal_port.to_string());
         }
         Kind::Bucket => {
             let access_key =
@@ -150,11 +180,17 @@ pub fn outputs_for(
             let secret_key =
                 existing_output(have, "secret_key").unwrap_or_else(|| generate_secret(32));
             out.insert("endpoint".into(), format!("http://127.0.0.1:{port}"));
+            out.insert(
+                "internal_endpoint".into(),
+                format!("http://{in_host}:{internal_port}"),
+            );
             out.insert("access_key".into(), access_key);
             out.insert("secret_key".into(), secret_key);
             out.insert("bucket".into(), r.name.clone());
             out.insert("host".into(), "127.0.0.1".into());
             out.insert("port".into(), port.to_string());
+            out.insert("internal_host".into(), in_host.to_string());
+            out.insert("internal_port".into(), internal_port.to_string());
         }
     }
     out
@@ -179,12 +215,11 @@ mod tests {
 
     fn postgres_spec() -> Project {
         let mut p = Project::new("demo");
-        p.resources.push(Resource {
-            name: "appdb".into(),
-            kind: Kind::Postgres,
-            version: Some("16".into()),
-            port: Some(5433),
-        });
+        p.resources.push(
+            Resource::new("appdb", Kind::Postgres)
+                .with_version("16")
+                .with_port(5433),
+        );
         p
     }
 
@@ -212,12 +247,7 @@ mod tests {
         let spec = postgres_spec();
         let first = prepare_state(&spec, &State::default());
         let mut spec2 = spec.clone();
-        spec2.resources.push(Resource {
-            name: "other".into(),
-            kind: Kind::Postgres,
-            version: None,
-            port: None,
-        });
+        spec2.resources.push(Resource::new("other", Kind::Postgres));
         let next = prepare_state(&spec2, &first);
         assert_eq!(
             first.resources["appdb"].outputs["password"],
@@ -227,6 +257,19 @@ mod tests {
             next.resources["appdb"].outputs["password"],
             next.resources["other"].outputs["password"]
         );
+    }
+
+    #[test]
+    fn host_uri_is_loopback_internal_uses_dns() {
+        let spec = postgres_spec();
+        let state = prepare_state(&spec, &State::default());
+        let outs = &state.resources["appdb"].outputs;
+        assert!(outs["uri"].contains("@127.0.0.1:5433/"));
+        assert!(outs["internal_uri"].contains("@appdb:5432/"));
+        assert_eq!(outs["host"], "127.0.0.1");
+        assert_eq!(outs["internal_host"], "appdb");
+        assert_eq!(outs["internal_port"], "5432");
+        assert_eq!(outs["bind"], "127.0.0.1");
     }
 
     #[test]

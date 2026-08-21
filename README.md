@@ -9,7 +9,10 @@ use tofy::prelude::*;
 
 #[tofy::main]
 fn main() {
-    let db = postgres("appdb").version("16").port(5433);
+    let db = postgres("appdb")
+        .version("16")
+        .port(5433)
+        .size(Size::Small);
     let cache = redis("cache");
     let files = bucket("uploads");
     stack("demo").add(db).add(cache).add(files);
@@ -17,6 +20,8 @@ fn main() {
 ```
 
 `postgres()` returns a declaration, not a live connection. `cargo run` in the infra crate is apply.
+
+Each stack gets a private Docker network (`tofy-demo` here). Resources resolve each other by name (`appdb`, `cache`, `uploads`). You do not declare a network. Published ports default to `127.0.0.1`; use `.bind(Bind::All)` for `0.0.0.0`.
 
 ## Commands
 
@@ -48,9 +53,24 @@ After apply, `.tofy/outputs.env` and `.tofy/outputs.json` use `TOFY_<RESOURCE>_<
 
 | Resource | Keys |
 | --- | --- |
-| `appdb` (postgres) | `TOFY_APPDB_URI`, `TOFY_APPDB_PASSWORD`, `TOFY_APPDB_USER`, `TOFY_APPDB_DATABASE`, `TOFY_APPDB_PORT`, `TOFY_APPDB_HOST` |
-| `cache` (redis) | `TOFY_CACHE_URI`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST` |
-| `uploads` (bucket) | `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT` |
+| stack | `TOFY_NETWORK` (`tofy-demo`) |
+| `appdb` (postgres) | `TOFY_APPDB_URI`, `TOFY_APPDB_PASSWORD`, `TOFY_APPDB_USER`, `TOFY_APPDB_DATABASE`, `TOFY_APPDB_PORT`, `TOFY_APPDB_HOST`, plus `TOFY_APPDB_INTERNAL_*` |
+| `cache` (redis) | `TOFY_CACHE_URI`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*` |
+| `uploads` (bucket) | `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*` |
+
+`tofy run` on the host uses loopback URIs (`postgres://…@127.0.0.1:5433/…`). A sibling container on the stack network uses the DNS name and the container port (`postgres://…@appdb:5432/…`) from the `INTERNAL_*` keys.
+
+## Size and replicas
+
+`.size(Size::Small | Medium | Large)` is an attribute, not a new resource type. Local Docker maps it to memory/CPU. A later OpenTofu backend maps the same token to instance class.
+
+| size | local Docker | later OpenTofu instance class |
+| --- | --- | --- |
+| `small` (default) | 256MiB, 0.25 CPU | `small` |
+| `medium` | 512MiB, 0.50 CPU | `medium` |
+| `large` | 1GiB, 1.00 CPU | `large` |
+
+`.replicas(n)` is allowed on `redis` and `bucket`. Local postgres stays at 1; `replicas > 1` fails with `local backend has no HA`. Plan treats size, replica, and bind changes as updates. Extra local replicas share the resource DNS name; only replica 1 is published to the host.
 
 Secrets (passwords, keys, URIs that embed them) are generated once, stored in `.tofy/state.json` (mode `0600`), and reused on the next apply. They are never re-derived as `tofy-{project}-{name}`.
 
@@ -66,7 +86,9 @@ Secrets (passwords, keys, URIs that embed them) are generated once, stored in `.
 
 ## Language
 
-Small on purpose: `postgres`, `redis`, `bucket`. App-adjacent resources only. VPCs and IAM stay in real Terraform / OpenTofu.
+Small on purpose: `postgres`, `redis`, `bucket`. App-adjacent resources only.
+
+**Out of scope (use real Terraform / OpenTofu):** VPCs, subnets, security groups, load balancers, IAM. This language does not grow those types. The private Docker network is for in-stack DNS, not a VPC.
 
 YAML is an importer to the same IR (`tofy apply --spec tofy.yaml`), not the happy path.
 

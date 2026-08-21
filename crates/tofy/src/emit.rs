@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use tofy_spec::{Kind, Project};
+use tofy_spec::{docker_network, Kind, Project};
 
 use crate::error::Result;
 use crate::state::{docker_image, State};
@@ -17,6 +17,7 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
     let mut containers = serde_json::Map::new();
     let mut images = serde_json::Map::new();
     let mut outputs = serde_json::Map::new();
+    let net = docker_network(&spec.project);
 
     for r in &spec.resources {
         let image = docker_image(r);
@@ -34,10 +35,20 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
             "ports": [{
                 "internal": r.kind.internal_port(),
                 "external": r.port_or_default(),
-                "ip": "127.0.0.1",
+                "ip": r.bind.as_ip(),
             }],
             "env": env,
             "must_run": true,
+            "memory": r.size.docker_memory(),
+            "cpu_shares": match r.size.as_str() {
+                "small" => 256,
+                "medium" => 512,
+                _ => 1024,
+            },
+            "networks_advanced": [{
+                "name": net,
+                "aliases": [r.name.clone()],
+            }],
         });
         if let Some(cmd) = cmd {
             c["command"] = json!(cmd);
@@ -59,6 +70,12 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
         "terraform": { "required_providers": required },
         "provider": { "docker": { "host": "unix:///var/run/docker.sock" } },
         "resource": {
+            "docker_network": {
+                "stack": {
+                    "name": net,
+                    "labels": [{ "label": "tofy.project", "value": spec.project }],
+                }
+            },
             "docker_image": images,
             "docker_container": containers,
         },
@@ -67,36 +84,62 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
 }
 
 pub fn compose_yaml(spec: &Project, state: &State) -> String {
+    let net = docker_network(&spec.project);
     let mut s = String::from("services:\n");
     for r in &spec.resources {
-        let outs = state
-            .resources
-            .get(&r.name)
-            .map(|st| st.outputs.clone())
-            .unwrap_or_default();
-        let (env, cmd) = container_env(r.kind, &outs);
-        s.push_str(&format!("  {}:\n", r.name));
-        s.push_str(&format!("    image: {}\n", docker_image(r)));
-        s.push_str(&format!(
-            "    container_name: tofy-{}-{}\n",
-            spec.project, r.name
-        ));
-        s.push_str(&format!(
-            "    ports:\n      - \"127.0.0.1:{}:{}\"\n",
-            r.port_or_default(),
-            r.kind.internal_port()
-        ));
-        if !env.is_empty() {
-            s.push_str("    environment:\n");
-            for e in env {
-                let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
-                s.push_str(&format!("      {k}: \"{v}\"\n"));
+        let replicas = r.replicas_or_default();
+        for i in 0..replicas {
+            let svc = if i == 0 {
+                r.name.clone()
+            } else {
+                format!("{}-{}", r.name, i + 1)
+            };
+            let outs = state
+                .resources
+                .get(&r.name)
+                .map(|st| st.outputs.clone())
+                .unwrap_or_default();
+            let (env, cmd) = container_env(r.kind, &outs);
+            s.push_str(&format!("  {svc}:\n"));
+            s.push_str(&format!("    image: {}\n", docker_image(r)));
+            s.push_str(&format!(
+                "    container_name: {}\n",
+                tofy_spec::replica_container(&spec.project, &r.name, i)
+            ));
+            s.push_str(&format!("    hostname: {svc}\n"));
+            s.push_str(&format!("    mem_limit: {}\n", r.size.docker_memory()));
+            s.push_str(&format!("    cpus: {}\n", r.size.docker_cpus()));
+            if i == 0 {
+                s.push_str(&format!(
+                    "    ports:\n      - \"{}:{}:{}\"\n",
+                    r.bind.as_ip(),
+                    r.port_or_default(),
+                    r.kind.internal_port()
+                ));
+            }
+            if !env.is_empty() {
+                s.push_str("    environment:\n");
+                for e in env {
+                    let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
+                    s.push_str(&format!("      {k}: \"{v}\"\n"));
+                }
+            }
+            if let Some(cmd) = cmd {
+                s.push_str(&format!("    command: {}\n", cmd.join(" ")));
+            }
+            s.push_str("    networks:\n");
+            s.push_str(&format!(
+                "      stack:\n        aliases:\n          - {}\n",
+                r.name
+            ));
+            if i > 0 {
+                s.push_str(&format!("          - {svc}\n"));
             }
         }
-        if let Some(cmd) = cmd {
-            s.push_str(&format!("    command: {}\n", cmd.join(" ")));
-        }
     }
+    s.push_str("networks:\n");
+    s.push_str("  stack:\n");
+    s.push_str(&format!("    name: {net}\n"));
     s
 }
 

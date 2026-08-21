@@ -9,24 +9,16 @@ use tofy::spec::{Kind, Project, Resource};
 
 fn demo_spec() -> Project {
     let mut p = Project::new("tofy-smoke");
-    p.resources.push(Resource {
-        name: "appdb".into(),
-        kind: Kind::Postgres,
-        version: Some("16".into()),
-        port: Some(55433),
-    });
-    p.resources.push(Resource {
-        name: "cache".into(),
-        kind: Kind::Redis,
-        version: None,
-        port: Some(56379),
-    });
-    p.resources.push(Resource {
-        name: "uploads".into(),
-        kind: Kind::Bucket,
-        version: None,
-        port: Some(59000),
-    });
+    p.resources.push(
+        Resource::new("appdb", Kind::Postgres)
+            .with_version("16")
+            .with_port(55433)
+            .with_size(tofy::spec::Size::Small),
+    );
+    p.resources
+        .push(Resource::new("cache", Kind::Redis).with_port(56379));
+    p.resources
+        .push(Resource::new("uploads", Kind::Bucket).with_port(59000));
     p
 }
 

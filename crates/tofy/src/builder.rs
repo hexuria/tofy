@@ -1,17 +1,20 @@
 use std::cell::RefCell;
 
-use tofy_spec::{Kind, Project, Resource};
+use tofy_spec::{Bind, Kind, Project, Resource, Size};
 
 thread_local! {
     static DECLARED: RefCell<Option<Project>> = const { RefCell::new(None) };
 }
 
 /// Postgres resource declaration. Not a database client.
+/// Local postgres has no HA; there is no `.replicas()` on this type.
 #[derive(Debug, Clone)]
 pub struct Postgres {
     name: String,
     version: Option<String>,
     port: Option<u16>,
+    size: Size,
+    bind: Bind,
 }
 
 impl Postgres {
@@ -24,6 +27,16 @@ impl Postgres {
         self.port = Some(port);
         self
     }
+
+    pub fn size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn bind(mut self, bind: Bind) -> Self {
+        self.bind = bind;
+        self
+    }
 }
 
 impl From<Postgres> for Resource {
@@ -33,6 +46,9 @@ impl From<Postgres> for Resource {
             kind: Kind::Postgres,
             version: p.version,
             port: p.port,
+            size: p.size,
+            bind: p.bind,
+            replicas: 1,
         }
     }
 }
@@ -43,6 +59,9 @@ pub struct Redis {
     name: String,
     version: Option<String>,
     port: Option<u16>,
+    size: Size,
+    bind: Bind,
+    replicas: u32,
 }
 
 impl Redis {
@@ -55,6 +74,21 @@ impl Redis {
         self.port = Some(port);
         self
     }
+
+    pub fn size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn bind(mut self, bind: Bind) -> Self {
+        self.bind = bind;
+        self
+    }
+
+    pub fn replicas(mut self, n: u32) -> Self {
+        self.replicas = n;
+        self
+    }
 }
 
 impl From<Redis> for Resource {
@@ -64,6 +98,9 @@ impl From<Redis> for Resource {
             kind: Kind::Redis,
             version: r.version,
             port: r.port,
+            size: r.size,
+            bind: r.bind,
+            replicas: r.replicas,
         }
     }
 }
@@ -74,6 +111,9 @@ pub struct Bucket {
     name: String,
     version: Option<String>,
     port: Option<u16>,
+    size: Size,
+    bind: Bind,
+    replicas: u32,
 }
 
 impl Bucket {
@@ -86,6 +126,21 @@ impl Bucket {
         self.port = Some(port);
         self
     }
+
+    pub fn size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn bind(mut self, bind: Bind) -> Self {
+        self.bind = bind;
+        self
+    }
+
+    pub fn replicas(mut self, n: u32) -> Self {
+        self.replicas = n;
+        self
+    }
 }
 
 impl From<Bucket> for Resource {
@@ -95,6 +150,9 @@ impl From<Bucket> for Resource {
             kind: Kind::Bucket,
             version: b.version,
             port: b.port,
+            size: b.size,
+            bind: b.bind,
+            replicas: b.replicas,
         }
     }
 }
@@ -117,6 +175,8 @@ pub fn postgres(name: impl Into<String>) -> Postgres {
         name: name.into(),
         version: None,
         port: None,
+        size: Size::Small,
+        bind: Bind::Localhost,
     }
 }
 
@@ -125,6 +185,9 @@ pub fn redis(name: impl Into<String>) -> Redis {
         name: name.into(),
         version: None,
         port: None,
+        size: Size::Small,
+        bind: Bind::Localhost,
+        replicas: 1,
     }
 }
 
@@ -133,6 +196,9 @@ pub fn bucket(name: impl Into<String>) -> Bucket {
         name: name.into(),
         version: None,
         port: None,
+        size: Size::Small,
+        bind: Bind::Localhost,
+        replicas: 1,
     }
 }
 
@@ -153,17 +219,26 @@ mod tests {
 
     #[test]
     fn builders_emit_spec() {
-        let db = postgres("appdb").version("16").port(5433);
-        let cache = redis("cache");
+        let db = postgres("appdb")
+            .version("16")
+            .port(5433)
+            .size(Size::Small)
+            .bind(Bind::Localhost);
+        let cache = redis("cache").replicas(2).size(Size::Medium);
         let files = bucket("uploads");
         stack("demo").add(db).add(cache).add(files);
         let project = take_project().unwrap();
         assert_eq!(project.project, "demo");
+        assert_eq!(project.docker_network(), "tofy-demo");
         assert_eq!(project.resources.len(), 3);
         assert_eq!(project.resources[0].name, "appdb");
         assert_eq!(project.resources[0].kind, Kind::Postgres);
         assert_eq!(project.resources[0].port, Some(5433));
+        assert_eq!(project.resources[0].size, Size::Small);
+        assert_eq!(project.resources[0].replicas, 1);
         assert_eq!(project.resources[1].kind, Kind::Redis);
+        assert_eq!(project.resources[1].replicas, 2);
+        assert_eq!(project.resources[1].size, Size::Medium);
         assert_eq!(project.resources[2].kind, Kind::Bucket);
     }
 }

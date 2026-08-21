@@ -33,7 +33,12 @@ pub fn plan(spec: &Project, current: &State) -> Vec<Action> {
                 kind: want.kind,
             }),
             Some(have)
-                if have.kind != want.kind || have.image != want.image || have.port != want.port =>
+                if have.kind != want.kind
+                    || have.image != want.image
+                    || have.port != want.port
+                    || have.size != want.size
+                    || have.bind != want.bind
+                    || have.replicas != want.replicas =>
             {
                 let mut parts = Vec::new();
                 if have.kind != want.kind {
@@ -44,6 +49,15 @@ pub fn plan(spec: &Project, current: &State) -> Vec<Action> {
                 }
                 if have.port != want.port {
                     parts.push("port");
+                }
+                if have.size != want.size {
+                    parts.push("size");
+                }
+                if have.bind != want.bind {
+                    parts.push("bind");
+                }
+                if have.replicas != want.replicas {
+                    parts.push("replicas");
                 }
                 actions.push(Action::Update {
                     name: name.clone(),
@@ -92,6 +106,7 @@ pub fn format_actions(actions: &[Action]) -> String {
 }
 
 pub fn plan_text(root: &Path, spec: &Project) -> Result<String> {
+    spec.validate()?;
     let current = State::load(root)?;
     Ok(format_actions(&plan(spec, &current)))
 }
@@ -113,10 +128,17 @@ pub fn apply(root: &Path, spec: &Project) -> Result<String> {
         return Err(Error::DockerMissing);
     }
 
+    if spec.resources.is_empty() {
+        docker::destroy_network(&spec.project)?;
+    } else {
+        docker::ensure_network(&spec.project)?;
+    }
+
     // Deletes first so ports can be reused.
     for a in &actions {
         if let Action::Delete { name, .. } = a {
-            docker::destroy_resource(&current.project, name)?;
+            let n = current.resources.get(name).map(|r| r.replicas).unwrap_or(1);
+            docker::destroy_resource(&current.project, name, n)?;
         }
     }
 
@@ -161,9 +183,10 @@ pub fn destroy(root: &Path) -> Result<String> {
     }
     if docker::available() {
         let project = current.project.clone();
-        for name in current.resources.keys() {
-            docker::destroy_resource(&project, name)?;
+        for (name, rs) in &current.resources {
+            docker::destroy_resource(&project, name, rs.replicas)?;
         }
+        docker::destroy_network(&project)?;
     }
     current.clear_resources();
     current.save(root)?;
@@ -188,12 +211,9 @@ mod tests {
     fn spec(resources: &[(&str, Kind, Option<u16>)]) -> Project {
         let mut p = Project::new("demo");
         for (name, kind, port) in resources {
-            p.resources.push(Resource {
-                name: (*name).into(),
-                kind: *kind,
-                version: None,
-                port: *port,
-            });
+            let mut r = Resource::new(*name, *kind);
+            r.port = *port;
+            p.resources.push(r);
         }
         p
     }
@@ -278,6 +298,31 @@ mod tests {
         assert_eq!(pass, second.resources["appdb"].outputs["password"]);
         let actions = plan(&spec, &first);
         assert!(actions.iter().all(|a| matches!(a, Action::Noop { .. })));
+    }
+
+    #[test]
+    fn plan_shows_size_and_replica_updates() {
+        let current_spec = spec(&[("cache", Kind::Redis, None)]);
+        let current = state_from(&current_spec);
+        let mut desired = spec(&[("cache", Kind::Redis, None)]);
+        desired.resources[0].size = tofy_spec::Size::Large;
+        desired.resources[0].replicas = 2;
+        let actions = plan(&desired, &current);
+        let text = format_actions(&actions);
+        assert!(text.contains("~ update  cache"), "{text}");
+        assert!(text.contains("size"), "{text}");
+        assert!(text.contains("replicas"), "{text}");
+        assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_shows_bind_update() {
+        let current_spec = spec(&[("appdb", Kind::Postgres, Some(5433))]);
+        let current = state_from(&current_spec);
+        let mut desired = spec(&[("appdb", Kind::Postgres, Some(5433))]);
+        desired.resources[0].bind = tofy_spec::Bind::All;
+        let text = format_actions(&plan(&desired, &current));
+        assert!(text.contains("bind changed"), "{text}");
     }
 
     #[test]

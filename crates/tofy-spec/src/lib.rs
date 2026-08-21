@@ -45,6 +45,76 @@ impl fmt::Display for Kind {
     }
 }
 
+/// App-adjacent size. Local backend maps this to memory/CPU.
+/// A later OpenTofu backend maps the same token to instance class.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Size {
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+impl Size {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Size::Small => "small",
+            Size::Medium => "medium",
+            Size::Large => "large",
+        }
+    }
+
+    /// Docker `--memory`.
+    pub fn docker_memory(self) -> &'static str {
+        match self {
+            Size::Small => "256m",
+            Size::Medium => "512m",
+            Size::Large => "1g",
+        }
+    }
+
+    /// Docker `--cpus`.
+    pub fn docker_cpus(self) -> &'static str {
+        match self {
+            Size::Small => "0.25",
+            Size::Medium => "0.50",
+            Size::Large => "1.00",
+        }
+    }
+}
+
+impl fmt::Display for Size {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Who can reach the published host port. In-stack traffic uses the private network.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Bind {
+    #[default]
+    #[serde(rename = "127.0.0.1")]
+    Localhost,
+    #[serde(rename = "0.0.0.0")]
+    All,
+}
+
+impl Bind {
+    pub fn as_ip(self) -> &'static str {
+        match self {
+            Bind::Localhost => "127.0.0.1",
+            Bind::All => "0.0.0.0",
+        }
+    }
+}
+
+impl fmt::Display for Bind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_ip())
+    }
+}
+
 impl Kind {
     pub fn default_port(self) -> u16 {
         match self {
@@ -67,6 +137,22 @@ impl Kind {
     }
 }
 
+fn is_default_size(s: &Size) -> bool {
+    *s == Size::Small
+}
+
+fn is_default_bind(b: &Bind) -> bool {
+    *b == Bind::Localhost
+}
+
+fn default_replicas() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resource {
     pub name: String,
@@ -76,6 +162,12 @@ pub struct Resource {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "is_default_size")]
+    pub size: Size,
+    #[serde(default, skip_serializing_if = "is_default_bind")]
+    pub bind: Bind,
+    #[serde(default = "default_replicas", skip_serializing_if = "is_one")]
+    pub replicas: u32,
 }
 
 impl Resource {
@@ -85,7 +177,35 @@ impl Resource {
             kind,
             version: None,
             port: None,
+            size: Size::Small,
+            bind: Bind::Localhost,
+            replicas: 1,
         }
+    }
+
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    pub fn with_size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn with_bind(mut self, bind: Bind) -> Self {
+        self.bind = bind;
+        self
+    }
+
+    pub fn with_replicas(mut self, replicas: u32) -> Self {
+        self.replicas = replicas;
+        self
     }
 
     pub fn version_or_default(&self) -> &str {
@@ -96,6 +216,10 @@ impl Resource {
 
     pub fn port_or_default(&self) -> u16 {
         self.port.unwrap_or_else(|| self.kind.default_port())
+    }
+
+    pub fn replicas_or_default(&self) -> u32 {
+        self.replicas.max(1)
     }
 }
 
@@ -152,8 +276,24 @@ impl Project {
                     r.name
                 )));
             }
+            if r.replicas == 0 {
+                return Err(SpecError::Validation(format!(
+                    "resource {} replicas must be >= 1",
+                    r.name
+                )));
+            }
+            if r.kind == Kind::Postgres && r.replicas > 1 {
+                return Err(SpecError::Validation(
+                    "local backend has no HA: postgres replicas must be 1".into(),
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// Stack-private Docker network name: `tofy-{project}`.
+    pub fn docker_network(&self) -> String {
+        docker_network(&self.project)
     }
 
     pub fn resource(&self, name: &str) -> Option<&Resource> {
@@ -208,6 +348,32 @@ pub fn container_name(project: &str, resource: &str) -> String {
 
 pub fn volume_name(project: &str, resource: &str) -> String {
     format!("tofy-{project}-{resource}-data")
+}
+
+pub fn docker_network(project: &str) -> String {
+    format!("tofy-{project}")
+}
+
+/// Replica 0 uses the resource container name; later replicas append `-2`, `-3`, …
+pub fn replica_container(project: &str, resource: &str, index: u32) -> String {
+    if index == 0 {
+        container_name(project, resource)
+    } else {
+        format!("{}-{}", container_name(project, resource), index + 1)
+    }
+}
+
+pub fn replica_volume(project: &str, resource: &str, index: u32) -> String {
+    if index == 0 {
+        volume_name(project, resource)
+    } else {
+        format!("{}-{}", volume_name(project, resource), index + 1)
+    }
+}
+
+/// In-stack DNS name: the resource name on the private network.
+pub fn internal_host(resource: &str) -> &str {
+    resource
 }
 
 #[cfg(test)]
@@ -292,5 +458,58 @@ mod tests {
         assert!(!is_secret_key("TOFY_APPDB_USER"));
         assert!(!is_secret_key("TOFY_UPLOADS_ENDPOINT"));
         assert!(!is_secret_key("TOFY_UPLOADS_BUCKET"));
+    }
+
+    #[test]
+    fn parse_size_bind_replicas() {
+        let spec = Project::from_json_str(
+            r#"{
+                "project": "demo",
+                "resources": [
+                    {"name": "appdb", "type": "postgres", "size": "medium", "bind": "0.0.0.0"},
+                    {"name": "cache", "type": "redis", "replicas": 2, "size": "large"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(spec.resources[0].size, Size::Medium);
+        assert_eq!(spec.resources[0].bind, Bind::All);
+        assert_eq!(spec.resources[0].replicas, 1);
+        assert_eq!(spec.resources[1].size, Size::Large);
+        assert_eq!(spec.resources[1].replicas, 2);
+        assert_eq!(spec.docker_network(), "tofy-demo");
+        assert_eq!(internal_host("appdb"), "appdb");
+    }
+
+    #[test]
+    fn defaults_omit_size_bind_replicas() {
+        let spec = Project::from_json_str(demo_json()).unwrap();
+        assert_eq!(spec.resources[0].size, Size::Small);
+        assert_eq!(spec.resources[0].bind, Bind::Localhost);
+        assert_eq!(spec.resources[0].replicas, 1);
+        let json = spec.to_json_pretty().unwrap();
+        assert!(!json.contains("\"size\""));
+        assert!(!json.contains("\"replicas\""));
+        assert!(!json.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn postgres_replicas_rejected() {
+        let err = Project::from_json_str(
+            r#"{
+                "project": "demo",
+                "resources": [{"name": "appdb", "type": "postgres", "replicas": 2}]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("local backend has no HA"));
+    }
+
+    #[test]
+    fn size_maps() {
+        assert_eq!(Size::Small.docker_memory(), "256m");
+        assert_eq!(Size::Small.docker_cpus(), "0.25");
+        assert_eq!(Size::Medium.docker_memory(), "512m");
+        assert_eq!(Size::Large.docker_memory(), "1g");
     }
 }

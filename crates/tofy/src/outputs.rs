@@ -8,6 +8,12 @@ use crate::state::{set_private, State};
 
 pub fn flatten(state: &State) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    if !state.project.is_empty() {
+        out.insert(
+            "TOFY_NETWORK".into(),
+            tofy_spec::docker_network(&state.project),
+        );
+    }
     for (name, res) in &state.resources {
         for (key, value) in &res.outputs {
             out.insert(env_var(name, key), value.clone());
@@ -83,27 +89,26 @@ mod tests {
     #[test]
     fn flatten_uses_tofy_prefix() {
         let mut spec = Project::new("demo");
-        spec.resources.push(Resource {
-            name: "appdb".into(),
-            kind: Kind::Postgres,
-            version: Some("16".into()),
-            port: Some(5433),
-        });
-        spec.resources.push(Resource {
-            name: "cache".into(),
-            kind: Kind::Redis,
-            version: None,
-            port: None,
-        });
+        spec.resources.push(
+            Resource::new("appdb", Kind::Postgres)
+                .with_version("16")
+                .with_port(5433),
+        );
+        spec.resources.push(Resource::new("cache", Kind::Redis));
         let state = prepare_state(&spec, &State::default());
         let flat = flatten(&state);
         assert!(flat.contains_key("TOFY_APPDB_URI"));
         assert!(flat.contains_key("TOFY_APPDB_PASSWORD"));
         assert!(flat.contains_key("TOFY_CACHE_URI"));
+        assert_eq!(flat["TOFY_NETWORK"], "tofy-demo");
+        assert!(flat["TOFY_APPDB_URI"].contains("@127.0.0.1:"));
+        assert!(flat["TOFY_APPDB_INTERNAL_URI"].contains("@appdb:5432/"));
         let public = format_public(&flat);
         assert!(!public.contains("PASSWORD"));
         assert!(!public.contains(&flat["TOFY_APPDB_PASSWORD"]));
         assert!(public.contains("TOFY_APPDB_PORT=5433"));
         assert!(public.contains("TOFY_CACHE_PORT=6379"));
+        assert!(public.contains("TOFY_APPDB_INTERNAL_HOST=appdb"));
+        assert!(public.contains("TOFY_NETWORK=tofy-demo"));
     }
 }

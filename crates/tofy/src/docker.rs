@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tofy_spec::{container_name, volume_name, Kind, Project, Resource};
+use tofy_spec::{docker_network, replica_container, replica_volume, Kind, Project, Resource};
 
 use crate::error::{Error, Result};
 use crate::state::{docker_image, ResourceState};
@@ -67,10 +67,85 @@ fn run_checked(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_network(project: &str) -> Result<String> {
+    let name = docker_network(project);
+    if network_exists(&name) {
+        return Ok(name);
+    }
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "network",
+        "create",
+        "--label",
+        &format!("tofy.project={project}"),
+        &name,
+    ]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    run_checked(cmd)?;
+    Ok(name)
+}
+
+pub fn network_exists(name: &str) -> bool {
+    Command::new("docker")
+        .args(["network", "inspect", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn destroy_network(project: &str) -> Result<()> {
+    let name = docker_network(project);
+    let _ = Command::new("docker")
+        .args(["network", "rm", &name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(())
+}
+
+fn remove_labeled(project: &str, resource: &str) -> Result<()> {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=tofy.project={project}"),
+            "--filter",
+            &format!("label=tofy.resource={resource}"),
+        ])
+        .output()?;
+    let ids = String::from_utf8_lossy(&out.stdout);
+    for id in ids.split_whitespace() {
+        remove_container(id)?;
+    }
+    Ok(())
+}
+
 pub fn start_resource(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
-    let name = container_name(&spec.project, &r.name);
-    let vol = volume_name(&spec.project, &r.name);
-    remove_container(&name)?;
+    ensure_network(&spec.project)?;
+    remove_labeled(&spec.project, &r.name)?;
+    let replicas = r.replicas_or_default();
+    for i in 0..replicas {
+        start_one(spec, r, rs, i)?;
+    }
+    if r.kind == Kind::Postgres {
+        wait_for_postgres(&replica_container(&spec.project, &r.name, 0), rs.port)?;
+    }
+    Ok(())
+}
+
+fn start_one(spec: &Project, r: &Resource, rs: &ResourceState, index: u32) -> Result<()> {
+    let name = replica_container(&spec.project, &r.name, index);
+    let vol = replica_volume(&spec.project, &r.name, index);
+    let net = docker_network(&spec.project);
+    let hostname = if index == 0 {
+        r.name.clone()
+    } else {
+        format!("{}-{}", r.name, index + 1)
+    };
 
     if matches!(r.kind, Kind::Postgres | Kind::Bucket) {
         let mut vc = Command::new("docker");
@@ -86,17 +161,34 @@ pub fn start_resource(spec: &Project, r: &Resource, rs: &ResourceState) -> Resul
         "-d",
         "--name",
         &name,
+        "--hostname",
+        &hostname,
+        "--network",
+        &net,
+        "--network-alias",
+        &r.name,
         "--restart",
         "unless-stopped",
+        "--memory",
+        r.size.docker_memory(),
+        "--cpus",
+        r.size.docker_cpus(),
         "--label",
         &format!("tofy.project={}", spec.project),
         "--label",
         &format!("tofy.resource={}", r.name),
+        "--label",
+        &format!("tofy.replica={}", index + 1),
     ]);
+    if index > 0 {
+        cmd.args(["--network-alias", &hostname]);
+    }
 
-    let host_port = rs.port;
-    let internal = r.kind.internal_port();
-    cmd.args(["-p", &format!("127.0.0.1:{host_port}:{internal}")]);
+    if index == 0 {
+        let host_port = rs.port;
+        let internal = r.kind.internal_port();
+        cmd.args(["-p", &format!("{}:{host_port}:{internal}", r.bind.as_ip())]);
+    }
 
     match r.kind {
         Kind::Postgres => {
@@ -136,34 +228,41 @@ pub fn start_resource(spec: &Project, r: &Resource, rs: &ResourceState) -> Resul
         }
     }
 
-    run_checked(cmd)?;
+    run_checked(cmd)
+}
 
-    if r.kind == Kind::Postgres {
-        wait_for_postgres(&name, host_port)?;
+pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
+    ensure_network(&spec.project)?;
+    let replicas = r.replicas_or_default();
+    for i in 0..replicas {
+        let name = replica_container(&spec.project, &r.name, i);
+        if container_running(&name) {
+            continue;
+        }
+        if container_exists(&name) {
+            let mut cmd = Command::new("docker");
+            cmd.args(["start", &name]);
+            run_checked(cmd)?;
+            if r.kind == Kind::Postgres && i == 0 {
+                wait_for_postgres(&name, rs.port)?;
+            }
+        } else {
+            start_one(spec, r, rs, i)?;
+            if r.kind == Kind::Postgres && i == 0 {
+                wait_for_postgres(&name, rs.port)?;
+            }
+        }
     }
     Ok(())
 }
 
-pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
-    let name = container_name(&spec.project, &r.name);
-    if container_running(&name) {
-        return Ok(());
+pub fn destroy_resource(project: &str, name: &str, replicas: u32) -> Result<()> {
+    let _ = remove_labeled(project, name);
+    let n = replicas.max(1);
+    for i in 0..n {
+        remove_container(&replica_container(project, name, i))?;
+        remove_volume(&replica_volume(project, name, i))?;
     }
-    if container_exists(&name) {
-        let mut cmd = Command::new("docker");
-        cmd.args(["start", &name]);
-        run_checked(cmd)?;
-        if r.kind == Kind::Postgres {
-            wait_for_postgres(&name, rs.port)?;
-        }
-        return Ok(());
-    }
-    start_resource(spec, r, rs)
-}
-
-pub fn destroy_resource(project: &str, name: &str) -> Result<()> {
-    remove_container(&container_name(project, name))?;
-    remove_volume(&volume_name(project, name))?;
     Ok(())
 }
 
