@@ -55,9 +55,30 @@ No AWS, no new kinds, no PgPool.
 - Honest `tofy plan` on `Backend::Tofu`: run the OpenTofu engine plan against the emitted 0600 `.tofy/main.tf.json` (init if needed). Print that plan. Redact secrets. Missing tofu errors and does not print `No changes.` as if it planned. Plan does not mark resources Applied. Local plan stays the live-refresh planner — do not replace it with tofu.
 - `examples/infra-tofu` is `stack("demotofu")` with host ports 15433 / 16379 / 19000 so it can coexist with `examples/infra` (`demo` / 5433 / 6379 / 9000). Containers are `tofy-demotofu-*`. Same three resources and `.backend(Backend::Tofu)`.
 
+## This PR — AWS backend
+
+`Backend::Aws` is a real OpenTofu AWS-provider engine. Same postgres / redis / bucket lines. No VPC, RDS, or IAM methods on the builders.
+
+- Selector on `Stack<Empty>`: `.backend(Backend::Aws)` (and `.aws()`). Prelude already exports `Backend`. Default remains `Backend::Local`. `Backend::Tofu` stays the docker-provider path.
+- Apply / plan / destroy run the OpenTofu engine (`tofu init` / plan / apply / destroy) against emitted AWS-provider JSON under `.tofy/main.tf.json` (mode `0600`). User-facing commands stay `tofy apply` / `tofy plan` / `tofy destroy`.
+- Mapping (language unchanged):
+
+  | kind | AWS resource | Small | Medium | Large |
+  | --- | --- | --- | --- | --- |
+  | `postgres` | RDS (`aws_db_instance`) | `db.t4g.micro` | `db.t4g.small` | `db.t4g.medium` |
+  | `redis` | ElastiCache Redis (1 node) | `cache.t4g.micro` | `cache.t4g.small` | `cache.t4g.medium` |
+  | `bucket` | S3 | `STANDARD` | `STANDARD` | `STANDARD` |
+
+- Replicas stay IR default 1. No `.replicas()`, `.vpc()`, `.instanceClass()`, `.multiAz()`.
+- Networking is the account default VPC via OpenTofu data sources. tofy does not create a VPC and does not add VPC language.
+- Credentials are ambient only (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION` / `AWS_DEFAULT_REGION`, shared config files). No minting, prompt, store, commit, or `tofy` AWS login.
+- Missing tofu or missing ambient AWS credentials: plan / apply / destroy error. Do not print Applied or Destroyed. Do not tell the user to run tofu themselves.
+- Secrets generated once (postgres / redis passwords) and persisted in `.tofy/state.json`. After apply, hosts come from OpenTofu outputs. S3 is IAM-less: bucket name + region + endpoint (no minted access keys). Plan redacts secrets.
+- Required CI job: unit tests, emit `examples/infra-aws`, `tofu init` + `tofu validate`, prove missing-creds apply / plan do not claim Applied / `No changes.`. Does **not** live-apply AWS. Local and tofu-docker smokes stay required and unchanged.
+- `examples/infra-aws` is `stack("demoaws")` with ports 25432 / 26379 so it does not collide with `demo` or `demotofu`.
+
 ## Later
 
-- Remote AWS only with ambient credentials already on the machine (env / profile). No credential minting in tofy. Size tokens can map to instance class then
 - Importers into the same IR (not a write path; not auto-loaded)
 - More app-adjacent kinds
 - Optional live `PgPool` after apply for Rust apps that want it. Do not default to Shuttle. The consume path for other languages stays env

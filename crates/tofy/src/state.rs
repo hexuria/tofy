@@ -109,6 +109,14 @@ pub fn docker_image(r: &Resource) -> String {
     }
 }
 
+fn aws_image(r: &Resource) -> String {
+    match r.kind {
+        Kind::Postgres => r.size.aws_rds_instance_class().to_string(),
+        Kind::Redis => r.size.aws_elasticache_node_type().to_string(),
+        Kind::Bucket => format!("s3:{}", r.size.aws_s3_storage_class()),
+    }
+}
+
 pub fn generate_secret(len: usize) -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -133,7 +141,10 @@ pub fn prepare_state(spec: &Project, current: &State) -> State {
             ResourceState {
                 kind: r.kind,
                 status: Status::Planned,
-                image: docker_image(r),
+                image: match spec.backend {
+                    Backend::Aws => aws_image(r),
+                    Backend::Local | Backend::Tofu => docker_image(r),
+                },
                 port: r.port_or_default(),
                 version: Some(r.version_or_default().to_string()),
                 size: r.size,
@@ -163,6 +174,21 @@ pub fn outputs_for(
     out.insert("bind".into(), r.bind.as_ip().to_string());
     out.insert("size".into(), r.size.as_str().to_string());
     out.insert("replicas".into(), r.replicas_or_default().to_string());
+    match spec.backend {
+        Backend::Aws => aws_outputs_for(spec, r, have, &mut out),
+        Backend::Local | Backend::Tofu => local_outputs_for(r, have, port, internal_port, in_host, &mut out),
+    }
+    out
+}
+
+fn local_outputs_for(
+    r: &Resource,
+    have: Option<&ResourceState>,
+    port: u16,
+    internal_port: u16,
+    in_host: &str,
+    out: &mut BTreeMap<String, String>,
+) {
     match r.kind {
         Kind::Postgres => {
             let user = "tofy".to_string();
@@ -219,7 +245,63 @@ pub fn outputs_for(
             out.insert("internal_port".into(), internal_port.to_string());
         }
     }
-    out
+}
+
+fn aws_outputs_for(
+    spec: &Project,
+    r: &Resource,
+    have: Option<&ResourceState>,
+    out: &mut BTreeMap<String, String>,
+) {
+    let port = r.port_or_default();
+    match r.kind {
+        Kind::Postgres => {
+            let user = "tofy".to_string();
+            let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
+            let database = r.name.replace('-', "_");
+            let host = existing_output(have, "host").unwrap_or_default();
+            if !host.is_empty() {
+                out.insert(
+                    "uri".into(),
+                    format!("postgres://{user}:{password}@{host}:{port}/{database}"),
+                );
+                out.insert("host".into(), host);
+            }
+            out.insert("user".into(), user);
+            out.insert("password".into(), password);
+            out.insert("database".into(), database);
+            out.insert("port".into(), port.to_string());
+        }
+        Kind::Redis => {
+            let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
+            let host = existing_output(have, "host").unwrap_or_default();
+            if !host.is_empty() {
+                out.insert(
+                    "uri".into(),
+                    format!("redis://:{password}@{host}:{port}"),
+                );
+                out.insert("host".into(), host);
+            }
+            out.insert("password".into(), password);
+            out.insert("port".into(), port.to_string());
+        }
+        Kind::Bucket => {
+            let bucket = existing_output(have, "bucket").unwrap_or_else(|| {
+                crate::aws::s3_bucket_name(&spec.project, &r.name, &generate_secret(8))
+            });
+            let region = existing_output(have, "region")
+                .or_else(crate::aws::region)
+                .unwrap_or_default();
+            out.insert("bucket".into(), bucket.clone());
+            if !region.is_empty() {
+                out.insert(
+                    "endpoint".into(),
+                    format!("https://{bucket}.s3.{region}.amazonaws.com"),
+                );
+                out.insert("region".into(), region);
+            }
+        }
+    }
 }
 
 pub fn mark_applied(state: &mut State) {
@@ -324,6 +406,38 @@ mod tests {
         assert_eq!(state.backend, Backend::Tofu);
         assert_eq!(state.as_project().backend, Backend::Tofu);
         assert_eq!(state.as_project().resources[0].name, "appdb");
+    }
+
+    #[test]
+    fn aws_outputs_are_iam_less_bucket_and_generated_secrets() {
+        let mut spec = Project::new("demoaws");
+        spec.backend = Backend::Aws;
+        spec.resources.push(Resource::new("appdb", Kind::Postgres).with_port(25432));
+        spec.resources.push(Resource::new("cache", Kind::Redis));
+        spec.resources.push(Resource::new("uploads", Kind::Bucket));
+        let first = prepare_state(&spec, &State::default());
+        let db = &first.resources["appdb"].outputs;
+        assert_eq!(db["password"].len(), 32);
+        assert!(!db.contains_key("host"), "{db:?}");
+        assert!(!db.contains_key("uri"), "{db:?}");
+        assert_eq!(db["user"], "tofy");
+        assert_eq!(first.resources["appdb"].image, "db.t4g.micro");
+        let cache = &first.resources["cache"].outputs;
+        assert_eq!(cache["password"].len(), 32);
+        assert!(!cache.contains_key("uri"));
+        let files = &first.resources["uploads"].outputs;
+        assert!(files["bucket"].starts_with("tofy-demoaws-uploads-"), "{files:?}");
+        assert!(!files.contains_key("access_key"), "{files:?}");
+        assert!(!files.contains_key("secret_key"), "{files:?}");
+        let second = prepare_state(&spec, &first);
+        assert_eq!(
+            first.resources["appdb"].outputs["password"],
+            second.resources["appdb"].outputs["password"]
+        );
+        assert_eq!(
+            first.resources["uploads"].outputs["bucket"],
+            second.resources["uploads"].outputs["bucket"]
+        );
     }
 
     #[test]

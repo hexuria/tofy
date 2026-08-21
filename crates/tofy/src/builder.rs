@@ -201,6 +201,11 @@ impl Stack<Empty> {
         self.backend(Backend::Tofu)
     }
 
+    /// `stack("demoaws").backend(Backend::Aws)`.
+    pub fn aws(self) -> Self {
+        self.backend(Backend::Aws)
+    }
+
     pub fn add(mut self, resource: impl ResourceDecl) -> Stack<NonEmpty> {
         self.project.resources.push(resource.into());
         Stack {
@@ -217,7 +222,7 @@ impl Stack<NonEmpty> {
     }
 
     /// Print the plan. Local: spec vs state and live Docker.
-    /// Tofu: OpenTofu engine plan against `.tofy/main.tf.json`.
+    /// Tofu / Aws: OpenTofu engine plan against `.tofy/main.tf.json`.
     pub fn plan(self) {
         mark_stack_closed();
         let root = workdir();
@@ -385,5 +390,15 @@ mod tests {
             .add(bucket("uploads"))
             .into_project();
         assert_eq!(local.backend, Backend::Local);
+        let via_aws = stack("demoaws")
+            .backend(Backend::Aws)
+            .add(postgres("appdb"))
+            .add(redis("cache"))
+            .add(bucket("uploads"))
+            .into_project();
+        assert_eq!(via_aws.backend, Backend::Aws);
+        assert_eq!(via_aws.resources.len(), 3);
+        let via_aws_fn = stack("demoaws").aws().add(bucket("uploads")).into_project();
+        assert_eq!(via_aws_fn.backend, Backend::Aws);
     }
 }

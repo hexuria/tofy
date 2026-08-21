@@ -243,6 +243,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "infra-aws"
+version = "0.1.0"
+dependencies = [
+ "tofy",
+]
+
+[[package]]
 name = "infra-tofu"
 version = "0.1.0"
 dependencies = [

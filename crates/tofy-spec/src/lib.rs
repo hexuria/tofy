@@ -24,6 +24,14 @@ pub enum Backend {
     #[default]
     Local,
     Tofu,
+    Aws,
+}
+
+impl Backend {
+    /// OpenTofu engine (docker provider or AWS provider). Default Local is Docker.
+    pub fn uses_opentofu(self) -> bool {
+        matches!(self, Backend::Tofu | Backend::Aws)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +103,31 @@ impl Size {
     /// Emitted so `tofu plan` is not permanently dirty (`memory_swap = 512 -> null`).
     pub fn docker_memory_swap_mb(self) -> u32 {
         self.docker_memory_mb().saturating_mul(2)
+    }
+
+    /// RDS `instance_class` for [`Backend::Aws`].
+    pub fn aws_rds_instance_class(self) -> &'static str {
+        match self {
+            Size::Small => "db.t4g.micro",
+            Size::Medium => "db.t4g.small",
+            Size::Large => "db.t4g.medium",
+        }
+    }
+
+    /// ElastiCache Redis `node_type` for [`Backend::Aws`].
+    pub fn aws_elasticache_node_type(self) -> &'static str {
+        match self {
+            Size::Small => "cache.t4g.micro",
+            Size::Medium => "cache.t4g.small",
+            Size::Large => "cache.t4g.medium",
+        }
+    }
+
+    /// S3 storage class for [`Backend::Aws`]. S3 has no instance class.
+    pub fn aws_s3_storage_class(self) -> &'static str {
+        match self {
+            Size::Small | Size::Medium | Size::Large => "STANDARD",
+        }
     }
 }
 
@@ -545,5 +578,30 @@ mod tests {
         .unwrap();
         assert_eq!(spec.backend, Backend::Tofu);
         assert_eq!(spec.resources[0].replicas, 1);
+        assert!(spec.backend.uses_opentofu());
+    }
+
+    #[test]
+    fn parse_aws_backend() {
+        let spec = Project::from_json_str(
+            r#"{"project":"demoaws","backend":"aws","resources":[{"name":"uploads","type":"bucket"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.backend, Backend::Aws);
+        assert!(spec.backend.uses_opentofu());
+        assert!(!Backend::Local.uses_opentofu());
+    }
+
+    #[test]
+    fn size_maps_aws_classes() {
+        assert_eq!(Size::Small.aws_rds_instance_class(), "db.t4g.micro");
+        assert_eq!(Size::Medium.aws_rds_instance_class(), "db.t4g.small");
+        assert_eq!(Size::Large.aws_rds_instance_class(), "db.t4g.medium");
+        assert_eq!(Size::Small.aws_elasticache_node_type(), "cache.t4g.micro");
+        assert_eq!(Size::Medium.aws_elasticache_node_type(), "cache.t4g.small");
+        assert_eq!(Size::Large.aws_elasticache_node_type(), "cache.t4g.medium");
+        assert_eq!(Size::Small.aws_s3_storage_class(), "STANDARD");
+        assert_eq!(Size::Medium.aws_s3_storage_class(), "STANDARD");
+        assert_eq!(Size::Large.aws_s3_storage_class(), "STANDARD");
     }
 }

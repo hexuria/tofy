@@ -20,6 +20,14 @@ pub enum Error {
         "OpenTofu engine is required for this backend; did not destroy. State left unchanged."
     )]
     DestroyNeedsTofu,
+    #[error("AWS credentials were not found in the environment; did not apply.")]
+    AwsCredentialsMissing,
+    #[error("AWS credentials were not found in the environment; did not plan.")]
+    PlanNeedsAwsCredentials,
+    #[error(
+        "AWS credentials were not found in the environment; did not destroy. State left unchanged."
+    )]
+    DestroyNeedsAwsCredentials,
     #[error(
         "another tofy apply or destroy is already running in this directory; did not apply or destroy"
     )]

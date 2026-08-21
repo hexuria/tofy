@@ -8,7 +8,7 @@ use crate::state::{set_private, State};
 
 pub fn flatten(state: &State) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    if !state.project.is_empty() {
+    if !state.project.is_empty() && state.backend != tofy_spec::Backend::Aws {
         out.insert(
             "TOFY_NETWORK".into(),
             tofy_spec::docker_network(&state.project),
