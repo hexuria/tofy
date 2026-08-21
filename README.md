@@ -80,6 +80,9 @@ tofy --dir examples/infra destroy
 
 # apply an already-emitted spec JSON (no Rust on that machine)
 tofy --dir . apply --spec spec.json
+
+# import a constrained Compose subset into that JSON IR (does not apply)
+tofy import compose docker-compose.yml --project demo -o spec.json
 ```
 
 `tofy plan` on the local backend refreshes live containers against `.tofy/state.json` and redacts passwords. A stopped or remapped container is a change, with a reason (`not running`, `port changed`). On `Backend::Tofu` and `Backend::Aws`, `tofy plan` runs the OpenTofu engine plan against the emitted 0600 `.tofy/main.tf.json` (init if needed) and prints that plan, with secrets redacted. Missing tofu is an error — it does not print `No changes.` as if it planned. Missing ambient AWS credentials on `Backend::Aws` is the same kind of error. Plan does not mark resources Applied. `tofy output` prints non-secret keys; `--json` dumps the local outputs file. Destroy tears down resources and clears state. If Docker is missing (local backend), the OpenTofu engine is missing (Tofu / Aws), or AWS credentials are missing (Aws), destroy errors and does not clear state. A second apply or destroy in the same directory while one is running is `Locked` (exclusive `flock`; a crash does not leave a permanent lock).

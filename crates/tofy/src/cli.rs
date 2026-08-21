@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
-use tofy_spec::Project;
+use tofy_spec::{Backend, Project};
 
 use crate::engine;
 use crate::error::{Error, Result};
+use crate::import;
 use crate::outputs;
 
 #[derive(Parser, Debug)]
@@ -48,6 +49,40 @@ pub enum Cmd {
     },
     /// Write spec JSON without applying
     Emit,
+    /// Emit JSON IR from an external format. Does not apply.
+    Import {
+        #[command(subcommand)]
+        format: ImportFormat,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ImportFormat {
+    /// Constrained Docker Compose subset → JSON IR (not auto-loaded, not a write path)
+    Compose {
+        /// Compose file
+        file: PathBuf,
+        /// Stack name (else Compose `name:`, else parent directory)
+        #[arg(long)]
+        project: Option<String>,
+        /// IR backend: local, tofu, or aws (default local)
+        #[arg(long, value_parser = parse_backend)]
+        backend: Option<Backend>,
+        /// Write JSON IR here. Omit to print stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+}
+
+fn parse_backend(s: &str) -> std::result::Result<Backend, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "local" => Ok(Backend::Local),
+        "tofu" => Ok(Backend::Tofu),
+        "aws" => Ok(Backend::Aws),
+        other => Err(format!(
+            "unknown backend {other:?}; expected local, tofu, or aws"
+        )),
+    }
 }
 
 impl Cmd {
@@ -76,7 +111,12 @@ fn dispatch(declared: Option<Project>) -> Result<DeclaredOutcome> {
     let root = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
     let cmd = Cmd::or_apply(cli.cmd.clone());
 
-    if declared.is_none() && cli.spec.is_none() && is_declaration_crate(&root) {
+    // Import produces IR; it does not need a declaration crate and must not apply.
+    if !matches!(cmd, Cmd::Import { .. })
+        && declared.is_none()
+        && cli.spec.is_none()
+        && is_declaration_crate(&root)
+    {
         forward_to_declaration(&root, &cli, &cmd)?;
         return Ok(DeclaredOutcome::Finished);
     }
@@ -116,6 +156,34 @@ fn dispatch(declared: Option<Project>) -> Result<DeclaredOutcome> {
             let spec = load_spec(&root, cli.spec.as_ref(), declared)?;
             print!("{}", engine::apply(&root, &spec)?);
             Ok(DeclaredOutcome::Applied)
+        }
+        Cmd::Import { format } => {
+            run_import(format)?;
+            Ok(DeclaredOutcome::Finished)
+        }
+    }
+}
+
+fn run_import(format: ImportFormat) -> Result<()> {
+    match format {
+        ImportFormat::Compose {
+            file,
+            project,
+            backend,
+            output,
+        } => {
+            let spec = import::from_compose_file(
+                &file,
+                project.as_deref(),
+                backend.unwrap_or(Backend::Local),
+            )?;
+            if let Some(path) = output {
+                import::write_spec_json(&spec, &path)?;
+                println!("Wrote {}", path.display());
+            } else {
+                print!("{}", spec.to_json_pretty()?);
+            }
+            Ok(())
         }
     }
 }
@@ -193,6 +261,11 @@ fn forward_to_declaration(dir: &Path, cli: &Cli, cmd: &Cmd) -> Result<()> {
             args.extend(rest.iter().cloned());
         }
         Cmd::Emit => args.push("emit".into()),
+        Cmd::Import { .. } => {
+            return Err(Error::Usage(
+                "tofy import does not use a declaration crate".into(),
+            ));
+        }
     }
 
     let status = Command::new("cargo")

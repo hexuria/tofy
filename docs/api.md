@@ -68,6 +68,8 @@ After apply, other languages **do not** import tofy.
 
 The JSON IR (`Project` / `Resource` / `Kind` / `Backend` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
 
+`tofy import compose <file>` maps a **constrained** Docker Compose subset (official `postgres` / `redis` / `minio/minio` images, ports, `mem_limit`) onto that same JSON IR. It writes spec JSON (or stdout). It does not apply, does not auto-load yaml, and `--spec` still rejects `.yaml` / `.yml`. Unknown images fail; Compose env passwords are not copied into the spec.
+
 When `backend` is `tofu`, apply and plan run the OpenTofu engine against an emitted docker-provider config under `.tofy/` (mode `0600` if it contains secrets). When `backend` is `aws`, the same commands run the OpenTofu engine against an AWS-provider config. Credentials are ambient (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, shared files). The user-facing commands are still `tofy apply` / `tofy plan` / `tofy destroy`. `examples/infra-tofu` uses `stack("demotofu")` and host ports 15433 / 16379 / 19000. `examples/infra-aws` uses `stack("demoaws")` and ports 25432 / 26379.
 
 ## AWS mapping
