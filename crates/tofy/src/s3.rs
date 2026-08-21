@@ -31,20 +31,38 @@ pub fn wait_for_object_store(port: u16) -> Result<()> {
 }
 
 pub fn ensure_bucket(port: u16, access_key: &str, secret_key: &str, bucket: &str) -> Result<()> {
-    match signed_status("HEAD", port, bucket, access_key, secret_key)? {
-        200 | 204 => return Ok(()),
-        404 | 0 => {}
-        other => {
-            return Err(Error::Engine(format!(
-                "HEAD bucket {bucket} on 127.0.0.1:{port} returned {other}"
-            )));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match signed_status("HEAD", port, bucket, access_key, secret_key) {
+            Ok(200) | Ok(204) => return Ok(()),
+            Ok(404) | Ok(0) => break,
+            Ok(503) | Err(_) if Instant::now() < deadline => {
+                // MinIO can answer /minio/health/live before the S3 API is ready.
+                std::thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+            Ok(other) => {
+                return Err(Error::Engine(format!(
+                    "HEAD bucket {bucket} on 127.0.0.1:{port} returned {other}"
+                )));
+            }
+            Err(e) => return Err(e),
         }
     }
-    match signed_status("PUT", port, bucket, access_key, secret_key)? {
-        200 | 204 | 409 => Ok(()),
-        status => Err(Error::Engine(format!(
-            "failed to create bucket {bucket} on 127.0.0.1:{port}: HTTP {status}"
-        ))),
+    loop {
+        match signed_status("PUT", port, bucket, access_key, secret_key) {
+            Ok(200) | Ok(204) | Ok(409) => return Ok(()),
+            Ok(503) | Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+            Ok(status) => {
+                return Err(Error::Engine(format!(
+                    "failed to create bucket {bucket} on 127.0.0.1:{port}: HTTP {status}"
+                )));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
