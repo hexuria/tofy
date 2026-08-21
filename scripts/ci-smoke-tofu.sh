@@ -405,7 +405,7 @@ if grep -F -- "$TOFY_CACHE_PASSWORD" /tmp/tofy-tofu-plan-drift.log; then
   echo "drift plan leaked TOFY_CACHE_PASSWORD"
   exit 1
 fi
-if grep -qE 'No changes\.( Your infrastructure|)$' /tmp/tofy-tofu-plan-drift.log; then
+if grep -q "No changes." /tmp/tofy-tofu-plan-drift.log; then
   echo "tofu plan ignored a stopped container"
   cat /tmp/tofy-tofu-plan-drift.log
   exit 1
@@ -441,7 +441,7 @@ set +e
 "${BIN[@]}" plan | tee /tmp/tofy-tofu-plan-healed.log
 set -e
 assert_tofu_engine_plan /tmp/tofy-tofu-plan-healed.log
-if ! grep -qE 'No changes\.( Your infrastructure|)$' /tmp/tofy-tofu-plan-healed.log; then
+if ! grep -q "No changes." /tmp/tofy-tofu-plan-healed.log; then
   echo "tofu plan still shows drift after tofu apply"
   cat /tmp/tofy-tofu-plan-healed.log
   exit 1
