@@ -4,7 +4,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tofy_spec::{docker_network, replica_container, replica_volume, Kind, Project, Resource};
+use tofy_spec::{
+    docker_network, replica_alias, replica_container, replica_volume, Kind, Project, Resource,
+};
 
 use crate::error::{Error, Result};
 use crate::state::{docker_image, ResourceState};
@@ -70,6 +72,30 @@ pub fn inspect_live(name: &str, internal_port: u16) -> ContainerLive {
         Ok(o) if o.status.success() => parse_inspect(&o.stdout, internal_port),
         _ => ContainerLive::Missing,
     }
+}
+
+/// Fold every replica into one live status for plan. Port/bind come from replica 0.
+/// A missing or stopped extra replica marks the resource not running so apply heals.
+pub fn inspect_replicas(project: &str, r: &Resource) -> ContainerLive {
+    let n = r.replicas_or_default();
+    let internal = r.kind.internal_port();
+    let mut status = inspect_live(&replica_container(project, &r.name, 0), internal);
+    for i in 1..n {
+        match inspect_live(&replica_container(project, &r.name, i), internal) {
+            ContainerLive::Missing => {
+                if let ContainerLive::Present(facts) = &mut status {
+                    facts.running = false;
+                }
+            }
+            ContainerLive::Present(extra) if !extra.running => {
+                if let ContainerLive::Present(facts) = &mut status {
+                    facts.running = false;
+                }
+            }
+            ContainerLive::Present(_) => {}
+        }
+    }
+    status
 }
 
 fn parse_inspect(bytes: &[u8], internal_port: u16) -> ContainerLive {
@@ -271,16 +297,22 @@ fn remove_labeled(project: &str, resource: &str) -> Result<()> {
 pub fn start_resource(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
     ensure_network(&spec.project)?;
     remove_labeled(&spec.project, &r.name)?;
-    start_one(spec, r, rs)?;
-    ready_resource(r, rs, &replica_container(&spec.project, &r.name, 0))?;
+    let n = r.replicas_or_default();
+    for i in 0..n {
+        start_one(spec, r, rs, i)?;
+    }
+    for i in 0..n {
+        ready_replica(r, rs, &replica_container(&spec.project, &r.name, i), i)?;
+    }
     Ok(())
 }
 
-fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
-    let name = replica_container(&spec.project, &r.name, 0);
-    let vol = replica_volume(&spec.project, &r.name, 0);
+fn start_one(spec: &Project, r: &Resource, rs: &ResourceState, index: u32) -> Result<()> {
+    let name = replica_container(&spec.project, &r.name, index);
+    let vol = replica_volume(&spec.project, &r.name, index);
     let net = docker_network(&spec.project);
-    let hostname = r.name.clone();
+    let alias = replica_alias(&r.name, index);
+    let replica_label = format!("tofy.replica={}", index + 1);
 
     if matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Bucket) {
         let mut vc = Command::new("docker");
@@ -297,11 +329,11 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
         "--name",
         &name,
         "--hostname",
-        &hostname,
+        &alias,
         "--network",
         &net,
         "--network-alias",
-        &r.name,
+        &alias,
         "--restart",
         "unless-stopped",
         "--memory",
@@ -313,11 +345,13 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
         "--label",
         &format!("tofy.resource={}", r.name),
         "--label",
-        "tofy.replica=1",
+        &replica_label,
     ]);
-    let host_port = rs.port;
-    let internal = r.kind.internal_port();
-    cmd.args(["-p", &format!("{}:{host_port}:{internal}", r.bind.as_ip())]);
+    if index == 0 {
+        let host_port = rs.port;
+        let internal = r.kind.internal_port();
+        cmd.args(["-p", &format!("{}:{host_port}:{internal}", r.bind.as_ip())]);
+    }
 
     match r.kind {
         Kind::Postgres => {
@@ -385,38 +419,51 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
 
 pub fn ensure_running(spec: &Project, r: &Resource, rs: &ResourceState) -> Result<()> {
     ensure_network(&spec.project)?;
-    let name = replica_container(&spec.project, &r.name, 0);
-    if !container_running(&name) {
-        if container_exists(&name) {
-            let mut cmd = Command::new("docker");
-            cmd.args(["start", &name]);
-            run_checked(cmd)?;
-        } else {
-            start_one(spec, r, rs)?;
+    let n = r.replicas_or_default();
+    for i in 0..n {
+        let name = replica_container(&spec.project, &r.name, i);
+        if !container_running(&name) {
+            if container_exists(&name) {
+                let mut cmd = Command::new("docker");
+                cmd.args(["start", &name]);
+                run_checked(cmd)?;
+            } else {
+                start_one(spec, r, rs, i)?;
+            }
         }
+        ready_replica(r, rs, &name, i)?;
     }
-    ready_resource(r, rs, &name)?;
     Ok(())
 }
 
 pub fn ready_resource(r: &Resource, rs: &ResourceState, container: &str) -> Result<()> {
+    ready_replica(r, rs, container, 0)
+}
+
+pub fn ready_replica(r: &Resource, rs: &ResourceState, container: &str, index: u32) -> Result<()> {
+    let host_port = index == 0;
     match r.kind {
-        Kind::Postgres => wait_for_postgres(container, rs.port),
+        Kind::Postgres => wait_for_postgres(container, rs.port, host_port),
         Kind::Mysql => {
             let password = rs
                 .outputs
                 .get("password")
                 .ok_or_else(|| Error::Engine("mysql password missing from state".into()))?;
-            wait_for_mysql(container, rs.port, password)
+            wait_for_mysql(container, rs.port, password, host_port)
         }
         Kind::Redis => {
             let password = rs
                 .outputs
                 .get("password")
                 .ok_or_else(|| Error::Engine("redis password missing from state".into()))?;
-            wait_for_redis(rs.port, password)
+            wait_for_redis(container, rs.port, password, host_port)
         }
         Kind::Bucket => {
+            if !host_port {
+                return Err(Error::Engine(
+                    "bucket has no HA: extra replicas are not started".into(),
+                ));
+            }
             wait_tcp("object store", rs.port)?;
             crate::s3::wait_for_object_store(rs.port)?;
             let access = rs
@@ -442,45 +489,46 @@ pub fn destroy_resource(project: &str, name: &str, replicas: u32) -> Result<()> 
     Ok(())
 }
 
-pub fn wait_for_postgres(container: &str, port: u16) -> Result<()> {
+pub fn wait_for_postgres(container: &str, port: u16, host_port: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if pg_ready(container, port) {
+        if pg_ready(container, port, host_port) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(Error::Engine(format!(
-                "Postgres on 127.0.0.1:{port} (container {container}) did not accept connections within 60s"
+                "Postgres on {container} did not accept connections within 60s"
             )));
         }
         thread::sleep(Duration::from_millis(400));
     }
 }
 
-pub fn wait_for_mysql(container: &str, port: u16, password: &str) -> Result<()> {
+pub fn wait_for_mysql(container: &str, port: u16, password: &str, host_port: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if mysql_ready(container, port, password) {
+        if mysql_ready(container, port, password, host_port) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(Error::Engine(format!(
-                "Mysql on 127.0.0.1:{port} (container {container}) did not accept connections within 60s"
+                "Mysql on {container} did not accept connections within 60s"
             )));
         }
         thread::sleep(Duration::from_millis(400));
     }
 }
 
-pub fn wait_for_redis(port: u16, password: &str) -> Result<()> {
+pub fn wait_for_redis(container: &str, port: u16, password: &str, host_port: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if redis_ready(port, password) {
+        if redis_container_ready(container, password) || (host_port && redis_ready(port, password))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(Error::Engine(format!(
-                "Redis on 127.0.0.1:{port} did not accept AUTH within 60s"
+                "Redis on {container} did not accept AUTH within 60s"
             )));
         }
         thread::sleep(Duration::from_millis(400));
@@ -530,7 +578,7 @@ fn redis_ready(port: u16, password: &str) -> bool {
     }
 }
 
-fn pg_ready(container: &str, port: u16) -> bool {
+fn pg_ready(container: &str, port: u16, host_port: bool) -> bool {
     let exec_ok = Command::new("docker")
         .args([
             "exec",
@@ -548,10 +596,10 @@ fn pg_ready(container: &str, port: u16) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    exec_ok || tcp_open(port)
+    exec_ok || (host_port && tcp_open(port))
 }
 
-fn mysql_ready(container: &str, port: u16, password: &str) -> bool {
+fn mysql_ready(container: &str, port: u16, password: &str, host_port: bool) -> bool {
     let pass = format!("-p{password}");
     let exec_ok = Command::new("docker")
         .args([
@@ -570,7 +618,17 @@ fn mysql_ready(container: &str, port: u16, password: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    exec_ok || tcp_open(port)
+    exec_ok || (host_port && tcp_open(port))
+}
+
+fn redis_container_ready(container: &str, password: &str) -> bool {
+    Command::new("docker")
+        .args(["exec", container, "redis-cli", "-a", password, "ping"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("PONG"))
+        .unwrap_or(false)
 }
 
 pub fn tcp_open(port: u16) -> bool {

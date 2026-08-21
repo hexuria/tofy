@@ -69,8 +69,11 @@ fn wait_ready(spec: &Project, state: &State) -> Result<()> {
             .resources
             .get(&r.name)
             .ok_or_else(|| Error::Engine(format!("missing prepared state for {}", r.name)))?;
-        let name = replica_container(&spec.project, &r.name, 0);
-        docker::ready_resource(r, rs, &name)?;
+        let n = r.replicas_or_default();
+        for i in 0..n {
+            let name = replica_container(&spec.project, &r.name, i);
+            docker::ready_replica(r, rs, &name, i)?;
+        }
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tofy_spec::{replica_container, Backend, Kind, Project};
+use tofy_spec::{Backend, Kind, Project};
 
 use crate::aws;
 use crate::docker::{self, ContainerFacts, ContainerLive};
@@ -163,11 +163,7 @@ fn observe_live(spec: &Project) -> BTreeMap<String, ContainerLive> {
         return live;
     }
     for r in &spec.resources {
-        let cname = replica_container(&spec.project, &r.name, 0);
-        live.insert(
-            r.name.clone(),
-            docker::inspect_live(&cname, r.kind.internal_port()),
-        );
+        live.insert(r.name.clone(), docker::inspect_replicas(&spec.project, r));
     }
     live
 }
@@ -495,6 +491,19 @@ mod tests {
         assert!(text.contains("~ update  appdb"));
         assert!(text.contains("port changed"));
         assert!(!text.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plan_replicas_change_is_update() {
+        let current_spec = spec(&[("cache", Kind::Redis, None)]);
+        let current = state_from(&current_spec);
+        let mut desired = spec(&[("cache", Kind::Redis, None)]);
+        desired.resources[0].replicas = 2;
+        let actions = plan(&desired, &current);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Update { name, reason } if name == "cache" && reason.contains("replicas")
+        )));
     }
 
     #[test]

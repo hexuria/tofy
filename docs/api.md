@@ -15,15 +15,15 @@ The written source is Rust. Builders are typestate: every builder is `Foo<S>` wi
 
 | Type | Methods on `Open` | Not on this type |
 | --- | --- | --- |
-| `Postgres<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
-| `Mysql<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
-| `Redis<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
+| `Postgres<Open>` | `version`, `port`, `size`, `bind`, `replicas` | `apply`, `add` |
+| `Mysql<Open>` | `version`, `port`, `size`, `bind`, `replicas` | `apply`, `add` |
+| `Redis<Open>` | `version`, `port`, `size`, `bind`, `replicas` | `apply`, `add` |
 | `Bucket<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
 
 `size` takes `Size { Small, Medium, Large }`, not a loose string.  
 `bind` takes `Bind::Localhost` (`127.0.0.1` on Docker backends) or `Bind::All` (`0.0.0.0`). On `Backend::Aws`, `Localhost` is SG ingress from the applying machine's public IPv4 `/32` (not loopback, not a silent `0.0.0.0/0`); `All` opens SG ingress to `0.0.0.0/0`. RDS is publicly reachable from that CIDR. ElastiCache has no public IP, so Redis stays VPC-only even with the same SG. Laptop Redis requires a VPN or an SSH/SSM tunnel (`scripts/redis-tunnel.sh`); ElastiCache will not get a public IP.
 
-The local backend has no HA. `replicas` is not a method on any Open builder. If the IR has `replicas > 1` on any kind, apply fails with `local backend has no HA`. The IR field stays (default 1) for a later backend.
+The local and Tofu docker backends accept `.replicas(n)` on postgres / mysql / redis. Replica 0 is published on the host port; further replicas are in-stack only (`name-2`, …). The host URI is replica 0. `Backend::Aws` still rejects `replicas > 1`. `bucket` stays 1 (`bucket has no HA`). Default examples stay at 1.
 
 `bucket("uploads")` starts the object store, waits until it accepts connections, and creates the bucket named `uploads`. `TOFY_UPLOADS_BUCKET` is that name only after the bucket exists.
 
@@ -50,9 +50,6 @@ The local backend has no HA. `replicas` is not a method on any Open builder. If 
 These do not compile. trybuild covers them under `crates/tofy/tests/fail/`.
 
 ```rust
-postgres("x").replicas(2);           // no replicas on Postgres<Open>
-mysql("x").replicas(2);              // no replicas on Mysql<Open>
-redis("x").replicas(2);              // no replicas on Redis<Open>
 bucket("x").replicas(2);             // no replicas on Bucket<Open>
 stack("d").apply();                  // no apply on Stack<Empty>
 stack("d").add(postgres("x")).apply().add(postgres("y")); // no add on Stack<Applied>
@@ -78,7 +75,7 @@ When `backend` is `tofu`, apply and plan run the OpenTofu engine against an emit
 
 ## AWS mapping
 
-Language stays `postgres` / `mysql` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`, `.multiAz()`, or `.replicas()` on the builders.
+Language stays `postgres` / `mysql` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`, or `.multiAz()` on the builders. `.replicas(n)` exists on postgres / mysql / redis Open; Aws still rejects `replicas > 1`.
 
 | kind | AWS resource | Small | Medium | Large |
 | --- | --- | --- | --- | --- |
