@@ -90,6 +90,12 @@ impl Size {
             Size::Large => 1024,
         }
     }
+
+    /// Docker default swap ceiling when only memory is set: 2× memory (MB).
+    /// Emitted so `tofu plan` is not permanently dirty (`memory_swap = 512 -> null`).
+    pub fn docker_memory_swap_mb(self) -> u32 {
+        self.docker_memory_mb().saturating_mul(2)
+    }
 }
 
 impl fmt::Display for Size {
@@ -521,10 +527,13 @@ mod tests {
         assert_eq!(Size::Small.docker_memory(), "256m");
         assert_eq!(Size::Small.docker_cpus(), "0.25");
         assert_eq!(Size::Small.docker_memory_mb(), 256);
+        assert_eq!(Size::Small.docker_memory_swap_mb(), 512);
         assert_eq!(Size::Medium.docker_memory(), "512m");
         assert_eq!(Size::Medium.docker_memory_mb(), 512);
+        assert_eq!(Size::Medium.docker_memory_swap_mb(), 1024);
         assert_eq!(Size::Large.docker_memory(), "1g");
         assert_eq!(Size::Large.docker_memory_mb(), 1024);
+        assert_eq!(Size::Large.docker_memory_swap_mb(), 2048);
         assert_eq!(Size::Large.docker_cpus(), "1.00");
     }
 

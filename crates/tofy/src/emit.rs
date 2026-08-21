@@ -34,6 +34,7 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
             "restart": "unless-stopped",
             "must_run": true,
             "memory": r.size.docker_memory_mb(),
+            "memory_swap": r.size.docker_memory_swap_mb(),
             "cpus": r.size.docker_cpus(),
             "ports": [{
                 "internal": r.kind.internal_port(),
@@ -280,6 +281,10 @@ mod tests {
             .unwrap()
             .contains_key("cache"));
         assert_eq!(tf["resource"]["docker_container"]["cache"]["memory"], 256);
+        assert_eq!(
+            tf["resource"]["docker_container"]["cache"]["memory_swap"],
+            512
+        );
         assert_eq!(tf["resource"]["docker_container"]["cache"]["cpus"], "0.25");
     }
 
@@ -297,6 +302,7 @@ mod tests {
         assert_eq!(c["ports"][0]["external"], 5433);
         assert_eq!(c["ports"][0]["ip"], "127.0.0.1");
         assert_eq!(c["memory"], 512);
+        assert_eq!(c["memory_swap"], 1024);
         assert_eq!(c["cpus"], "0.50");
         assert_eq!(
             tf["resource"]["docker_volume"]["appdb"]["name"],
