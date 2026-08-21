@@ -1,6 +1,16 @@
 /target
 **/*.rs.bk
-.tofy/
-docker-compose.yml
 .idea
 .vscode
+
+# Runtime state and secrets. Keep .gitkeep so the directory can exist in git.
+.tofy/*
+!.tofy/.gitkeep
+**/.tofy/*
+!**/.tofy/.gitkeep
+
+# Never commit these even if someone force-adds the directory
+**/.tofy/state.json
+**/.tofy/outputs.env
+**/.tofy/outputs.json
+**/.tofy/lock
