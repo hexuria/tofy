@@ -2,11 +2,12 @@
 
 The written source is Rust. Builders are typestate: every builder is `Foo<S>` with `_state: PhantomData<S>` and a zero-sized state type. Methods that are illegal in a state **do not exist** on that impl (not `#[deprecated]`, not a runtime error).
 
-`use tofy::prelude::*;` exports `postgres`, `redis`, `bucket`, `stack`, `Size`, `Bind`, `Backend`, and the `main` macro. `#[tofy::main]` still wraps `fn main`.
+`use tofy::prelude::*;` exports `postgres`, `mysql`, `redis`, `bucket`, `stack`, `Size`, `Bind`, `Backend`, and the `main` macro. `#[tofy::main]` still wraps `fn main`.
 
 ## Resource builders
 
 `postgres("appdb")` → `Postgres<Open>`  
+`mysql("appmysql")` → `Mysql<Open>`  
 `redis("cache")` → `Redis<Open>`  
 `bucket("uploads")` → `Bucket<Open>`
 
@@ -15,6 +16,7 @@ The written source is Rust. Builders are typestate: every builder is `Foo<S>` wi
 | Type | Methods on `Open` | Not on this type |
 | --- | --- | --- |
 | `Postgres<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
+| `Mysql<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
 | `Redis<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
 | `Bucket<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
 
@@ -49,6 +51,7 @@ These do not compile. trybuild covers them under `crates/tofy/tests/fail/`.
 
 ```rust
 postgres("x").replicas(2);           // no replicas on Postgres<Open>
+mysql("x").replicas(2);              // no replicas on Mysql<Open>
 redis("x").replicas(2);              // no replicas on Redis<Open>
 bucket("x").replicas(2);             // no replicas on Bucket<Open>
 stack("d").apply();                  // no apply on Stack<Empty>
@@ -68,20 +71,21 @@ After apply, other languages **do not** import tofy.
 
 The JSON IR (`Project` / `Resource` / `Kind` / `Backend` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
 
-`tofy import compose <file>` maps a **constrained** Docker Compose subset (official `postgres` / `redis` / `minio/minio` images, ports, `mem_limit`) onto that same JSON IR. It writes spec JSON (or stdout). It does not apply, does not auto-load yaml, and `--spec` still rejects `.yaml` / `.yml`. Unknown images fail; Compose env passwords are not copied into the spec.
+`tofy import compose <file>` maps a **constrained** Docker Compose subset (official `postgres` / `mysql` / `redis` / `minio/minio` images, ports, `mem_limit`) onto that same JSON IR. It writes spec JSON (or stdout). It does not apply, does not auto-load yaml, and `--spec` still rejects `.yaml` / `.yml`. Unknown images fail; Compose env passwords are not copied into the spec.
 
 When `backend` is `tofu`, apply and plan run the OpenTofu engine against an emitted docker-provider config under `.tofy/` (mode `0600` if it contains secrets). When `backend` is `aws`, the same commands run the OpenTofu engine against an AWS-provider config. Credentials are ambient (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, shared files). The user-facing commands are still `tofy apply` / `tofy plan` / `tofy destroy`. `examples/infra-tofu` uses `stack("demotofu")` and host ports 15433 / 16379 / 19000. `examples/infra-aws` uses `stack("demoaws")` and ports 25432 / 26379.
 
 ## AWS mapping
 
-Language stays `postgres` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`, `.multiAz()`, or `.replicas()` on the builders.
+Language stays `postgres` / `mysql` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`, `.multiAz()`, or `.replicas()` on the builders.
 
 | kind | AWS resource | Small | Medium | Large |
 | --- | --- | --- | --- | --- |
 | `postgres` | RDS instance | `db.t4g.micro` | `db.t4g.small` | `db.t4g.medium` |
+| `mysql` | RDS instance | `db.t4g.micro` | `db.t4g.small` | `db.t4g.medium` |
 | `redis` | ElastiCache Redis (1 node) | `cache.t4g.micro` | `cache.t4g.small` | `cache.t4g.medium` |
 | `bucket` | S3 | `STANDARD` | `STANDARD` | `STANDARD` |
 
-Postgres / Redis passwords are generated once and persisted like the local backend. After apply, `TOFY_*_HOST` / `TOFY_*_URI` come from the engine. Redis on Aws is ElastiCache with in-transit encryption, so `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS), not `redis://`. The bucket is IAM-less: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT`.
+Postgres / Mysql / Redis passwords are generated once and persisted like the local backend. After apply, `TOFY_*_HOST` / `TOFY_*_URI` come from the engine. Redis on Aws is ElastiCache with in-transit encryption, so `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS), not `redis://`. The bucket is IAM-less: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT`.
 
-At plan / apply / emit, tofy discovers the applying machine's public IPv4 and emits a tofy-owned security group in the account default VPC. Ingress is postgres / redis from that `/32` when bind is `Localhost`. RDS is `publicly_accessible` so the postgres host URI works from that machine. ElastiCache has no public IP: the same SG does not make Redis reachable from a laptop. If the public IP cannot be determined, the command errors; it does not open `0.0.0.0/0`. The `/32` is persisted in state so a later plan from a new IP is an SG-rule update. `Bind::All` is the documented wider ingress (`0.0.0.0/0`); the default example stays `Localhost`. No `.vpc()`, `.securityGroup()`, `.cidr()`, or `.publiclyAccessible()` on the builders.
+At plan / apply / emit, tofy discovers the applying machine's public IPv4 and emits a tofy-owned security group in the account default VPC. Ingress is postgres / mysql / redis from that `/32` when bind is `Localhost`. RDS is `publicly_accessible` so the postgres / mysql host URI works from that machine. ElastiCache has no public IP: the same SG does not make Redis reachable from a laptop. If the public IP cannot be determined, the command errors; it does not open `0.0.0.0/0`. The `/32` is persisted in state so a later plan from a new IP is an SG-rule update. `Bind::All` is the documented wider ingress (`0.0.0.0/0`); the default example stays `Localhost`. No `.vpc()`, `.securityGroup()`, `.cidr()`, or `.publiclyAccessible()` on the builders.

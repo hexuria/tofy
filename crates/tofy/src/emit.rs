@@ -56,11 +56,12 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
         if let Some(cmd) = cmd {
             c["command"] = json!(cmd);
         }
-        if matches!(r.kind, Kind::Postgres | Kind::Bucket) {
+        if matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Bucket) {
             let vol = replica_volume(&spec.project, &r.name, 0);
             volumes.insert(key.clone(), json!({ "name": vol }));
             let mount = match r.kind {
                 Kind::Postgres => "/var/lib/postgresql/data",
+                Kind::Mysql => "/var/lib/mysql",
                 Kind::Bucket => "/data",
                 Kind::Redis => unreachable!(),
             };
@@ -330,6 +331,66 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Result<Value> {
                     json!({ "value": format!("${{aws_db_instance.{key}.port}}") }),
                 );
             }
+            Kind::Mysql => {
+                let password = outs.get("password").cloned().unwrap_or_default();
+                let user = outs.get("user").cloned().unwrap_or_else(|| "tofy".into());
+                let database = outs
+                    .get("database")
+                    .cloned()
+                    .unwrap_or_else(|| r.name.replace('-', "_"));
+                let port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
+                sg_ingress.insert(
+                    key.clone(),
+                    json!({
+                        "security_group_id": "${aws_security_group.tofy.id}",
+                        "cidr_ipv4": ingress_cidr(r.bind, applier_cidr)?,
+                        "from_port": port,
+                        "to_port": port,
+                        "ip_protocol": "tcp",
+                        "description": format!("tofy mysql {}", r.name),
+                    }),
+                );
+                db_subnet_groups.insert(
+                    key.clone(),
+                    json!({
+                        "name": id,
+                        "subnet_ids": "${data.aws_subnets.default.ids}",
+                        "tags": { "tofy.project": spec.project, "tofy.resource": r.name },
+                    }),
+                );
+                db_instances.insert(
+                    key.clone(),
+                    json!({
+                        "identifier": id,
+                        "engine": "mysql",
+                        "engine_version": mysql_engine_version(r.version_or_default()),
+                        "instance_class": r.size.aws_rds_instance_class(),
+                        "allocated_storage": 20,
+                        "storage_type": "gp3",
+                        "username": user,
+                        "password": password,
+                        "db_name": database,
+                        "port": port,
+                        "db_subnet_group_name": format!("${{aws_db_subnet_group.{key}.name}}"),
+                        "vpc_security_group_ids": ["${aws_security_group.tofy.id}"],
+                        "publicly_accessible": true,
+                        "multi_az": false,
+                        "backup_retention_period": 0,
+                        "skip_final_snapshot": true,
+                        "deletion_protection": false,
+                        "apply_immediately": true,
+                        "tags": { "tofy.project": spec.project, "tofy.resource": r.name },
+                    }),
+                );
+                outputs.insert(
+                    format!("{}_host", r.name),
+                    json!({ "value": format!("${{aws_db_instance.{key}.address}}") }),
+                );
+                outputs.insert(
+                    format!("{}_port", r.name),
+                    json!({ "value": format!("${{aws_db_instance.{key}.port}}") }),
+                );
+            }
             Kind::Redis => {
                 let password = outs.get("password").cloned().unwrap_or_default();
                 let port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
@@ -488,6 +549,13 @@ fn postgres_engine_version(version: &str) -> String {
     version.split('.').next().unwrap_or("16").to_string()
 }
 
+fn mysql_engine_version(version: &str) -> String {
+    match version.split('.').next().unwrap_or("8") {
+        "5" => "5.7".into(),
+        _ => "8.0".into(),
+    }
+}
+
 fn redis_engine_version(version: &str) -> &'static str {
     match version.split('.').next().unwrap_or("7") {
         "6" => "6.2",
@@ -532,6 +600,27 @@ fn container_env(
                 format!(
                     "POSTGRES_DB={}",
                     outs.get("database").map(String::as_str).unwrap_or("app")
+                ),
+            ],
+            None,
+        ),
+        Kind::Mysql => (
+            vec![
+                format!(
+                    "MYSQL_USER={}",
+                    outs.get("user").map(String::as_str).unwrap_or("tofy")
+                ),
+                format!(
+                    "MYSQL_PASSWORD={}",
+                    outs.get("password").map(String::as_str).unwrap_or("")
+                ),
+                format!(
+                    "MYSQL_DATABASE={}",
+                    outs.get("database").map(String::as_str).unwrap_or("app")
+                ),
+                format!(
+                    "MYSQL_ROOT_PASSWORD={}",
+                    outs.get("password").map(String::as_str).unwrap_or("")
                 ),
             ],
             None,
@@ -936,5 +1025,44 @@ mod tests {
             first["resource"]["aws_s3_bucket"]["uploads"]["bucket"],
             second["resource"]["aws_s3_bucket"]["uploads"]["bucket"]
         );
+    }
+
+    #[test]
+    fn mysql_tofu_container_and_aws_rds_follow_postgres() {
+        let mut spec = Project::new("demo");
+        spec.resources
+            .push(Resource::new("appmysql", Kind::Mysql).with_port(3307));
+        let state = prepare_state(&spec, &State::default());
+        let tf = terraform_json(&spec, &state);
+        let c = &tf["resource"]["docker_container"]["appmysql"];
+        assert_eq!(c["ports"][0]["internal"], 3306);
+        assert_eq!(c["ports"][0]["external"], 3307);
+        let env = c["env"].as_array().unwrap();
+        let joined = env
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("MYSQL_USER=tofy"), "{joined}");
+        assert!(joined.contains("MYSQL_DATABASE=appmysql"), "{joined}");
+        assert_eq!(c["volumes"][0]["container_path"], "/var/lib/mysql");
+
+        let mut aws = Project::new("demoaws");
+        aws.backend = Backend::Aws;
+        aws.resources
+            .push(Resource::new("appmysql", Kind::Mysql).with_port(3306));
+        let mut aws_state = prepare_state(&aws, &State::default());
+        aws_state.applier_cidr = Some(APPLIER.into());
+        let atf = aws_terraform_json(&aws, &aws_state).unwrap();
+        let db = &atf["resource"]["aws_db_instance"]["appmysql"];
+        assert_eq!(db["engine"], "mysql");
+        assert_eq!(db["engine_version"], "8.0");
+        assert_eq!(db["instance_class"], "db.t4g.micro");
+        assert_eq!(db["publicly_accessible"], true);
+        assert_eq!(
+            atf["resource"]["aws_vpc_security_group_ingress_rule"]["appmysql"]["cidr_ipv4"],
+            APPLIER
+        );
+        assert!(atf["resource"].get("aws_vpc").is_none());
     }
 }
