@@ -80,4 +80,4 @@ Language stays `postgres` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`,
 | `redis` | ElastiCache Redis (1 node) | `cache.t4g.micro` | `cache.t4g.small` | `cache.t4g.medium` |
 | `bucket` | S3 | `STANDARD` | `STANDARD` | `STANDARD` |
 
-Postgres / Redis passwords are generated once and persisted like the local backend. After apply, `TOFY_*_HOST` / `TOFY_*_URI` come from the engine. The bucket is IAM-less: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT`.
+Postgres / Redis passwords are generated once and persisted like the local backend. After apply, `TOFY_*_HOST` / `TOFY_*_URI` come from the engine. Redis on Aws is ElastiCache with in-transit encryption, so `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS), not `redis://`. The bucket is IAM-less: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT`.

@@ -73,7 +73,7 @@ No AWS, no new kinds, no PgPool.
 - Networking is the account default VPC via OpenTofu data sources. tofy does not create a VPC and does not add VPC language.
 - Credentials are ambient only (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION` / `AWS_DEFAULT_REGION`, shared config files). No minting, prompt, store, commit, or `tofy` AWS login.
 - Missing tofu or missing ambient AWS credentials: plan / apply / destroy error. Do not print Applied or Destroyed. Do not tell the user to run tofu themselves.
-- Secrets generated once (postgres / redis passwords) and persisted in `.tofy/state.json`. After apply, hosts come from OpenTofu outputs. S3 is IAM-less: bucket name + region + endpoint (no minted access keys). Plan redacts secrets.
+- Secrets generated once (postgres / redis passwords) and persisted in `.tofy/state.json`. After apply, hosts come from OpenTofu outputs. Redis URI is `rediss://` because ElastiCache is created with transit encryption + AUTH. S3 is IAM-less: bucket name + region + endpoint (no minted access keys). Plan redacts secrets.
 - Required CI job: unit tests, emit `examples/infra-aws`, `tofu init` + `tofu validate`, prove missing-creds apply / plan do not claim Applied / `No changes.`. Does **not** live-apply AWS. Local and tofu-docker smokes stay required and unchanged.
 - `examples/infra-aws` is `stack("demoaws")` with ports 25432 / 26379 so it does not collide with `demo` or `demotofu`.
 
