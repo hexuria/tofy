@@ -11,6 +11,7 @@ pub mod docker;
 pub mod emit;
 pub mod engine;
 pub mod error;
+pub mod import;
 pub mod lock;
 pub mod outputs;
 pub mod prelude;
