@@ -6,4 +6,4 @@ pub use crate::builder::{
     bucket, postgres, redis, stack, Applied, Bucket, Empty, NonEmpty, Open, Postgres, Redis, Stack,
 };
 pub use crate::main;
-pub use tofy_spec::{Bind, Size};
+pub use tofy_spec::{Backend, Bind, Size};

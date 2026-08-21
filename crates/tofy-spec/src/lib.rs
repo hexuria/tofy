@@ -81,6 +81,15 @@ impl Size {
             Size::Large => "1.00",
         }
     }
+
+    /// kreuzwerker/docker `memory` (MB).
+    pub fn docker_memory_mb(self) -> u32 {
+        match self {
+            Size::Small => 256,
+            Size::Medium => 512,
+            Size::Large => 1024,
+        }
+    }
 }
 
 impl fmt::Display for Size {
@@ -511,7 +520,21 @@ mod tests {
     fn size_maps() {
         assert_eq!(Size::Small.docker_memory(), "256m");
         assert_eq!(Size::Small.docker_cpus(), "0.25");
+        assert_eq!(Size::Small.docker_memory_mb(), 256);
         assert_eq!(Size::Medium.docker_memory(), "512m");
+        assert_eq!(Size::Medium.docker_memory_mb(), 512);
         assert_eq!(Size::Large.docker_memory(), "1g");
+        assert_eq!(Size::Large.docker_memory_mb(), 1024);
+        assert_eq!(Size::Large.docker_cpus(), "1.00");
+    }
+
+    #[test]
+    fn parse_tofu_backend() {
+        let spec = Project::from_json_str(
+            r#"{"project":"demo","backend":"tofu","resources":[{"name":"cache","type":"redis"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.backend, Backend::Tofu);
+        assert_eq!(spec.resources[0].replicas, 1);
     }
 }

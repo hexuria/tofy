@@ -1,6 +1,6 @@
 # Plan
 
-## Phase 1 — this PR
+## Phase 1 — merged
 
 Rust typestate builders (`Foo<S>` + `PhantomData`) and `#[tofy::main]` are the written source. They emit JSON IR. The local engine plans and applies with Docker.
 
@@ -10,7 +10,7 @@ Rust typestate builders (`Foo<S>` + `PhantomData`) and `#[tofy::main]` are the w
 - `.size(Size::Small | Medium | Large)`. No `.replicas()` on any Open builder. IR field default 1; `replicas > 1` rejected (`local backend has no HA`)
 - Host URIs vs `INTERNAL_*` DNS URIs; `tofy run` injects `TOFY_*`
 - Secrets generated once (postgres, redis, object-store keys), state/outputs mode `0600`, apply lock
-- Apply does not write secret-bearing `docker-compose.yml` / `main.tf.json`
+- Apply does not write secret-bearing `docker-compose.yml` / `main.tf.json` as a world-readable default
 - Postgres / Redis / object-store readiness wait; create the named bucket before Applied
 - Redis `requirepass`; `TOFY_CACHE_URI` / `TOFY_CACHE_PASSWORD`
 - `Stack::apply()` applies (`engine::apply`) and only then returns `Applied`. Other CLI verbs exit without that type.
@@ -19,25 +19,33 @@ Rust typestate builders (`Foo<S>` + `PhantomData`) and `#[tofy::main]` are the w
 - These docs: `README.md`, this file, `docs/api.md`
 - No yaml auto-load. `--spec` is JSON IR only.
 
-No AWS RDS, VPC, Multi-AZ, or “run tofu yourself.” OpenTofu is not the apply engine yet.
+No AWS RDS, VPC, Multi-AZ, or “run tofu yourself.” Default apply stays the local Docker engine.
 
-## Phase 2 — OpenTofu backend
+## Phase 2 — this PR
 
-A real OpenTofu backend: `tofu init` / `tofu apply` / `tofu destroy` against the emitted configuration.
+A real OpenTofu backend. `Backend::Tofu` is no longer a dead enum. When the spec backend is Tofu, `tofy apply` / `tofy destroy` run the OpenTofu engine (`tofu init` / apply / destroy) against an emitted docker-provider configuration.
 
-- Docker provider first (same three kinds)
-- Remote AWS only with ambient credentials already on the machine (env / profile). No credential minting in tofy.
-- Do not add RDS, Multi-AZ, VPC, subnets, security groups, or load balancers in this phase
-- Keep the IR stable. Size tokens map to instance class; the replicas field stays in IR for a later backend
+- Selector on `Stack<Empty>`: `.backend(Backend::Tofu)` (and `.tofu()`). Prelude exports `Backend`.
+- Default remains `Backend::Local` so `stack("demo").add(...).apply()` is still docker.rs. Same postgres / redis / bucket lines.
+- Docker provider (kreuzwerker/docker): private network, bind, size, volumes for postgres/minio, redis `--requirepass`, one container per resource (replicas stay 1)
+- After tofu apply: wait until Postgres, Redis, and MinIO accept connections; create the named bucket; only then Applied
+- Tofu state under `.tofy/` (gitignore). If the config contains secrets, `main.tf.json` is mode `0600`. tofy `.tofy/state.json` still holds generated secrets, ports, Applied status, outputs
+- Missing OpenTofu engine: apply/destroy error, leave Applied/Destroyed unprinted, leave destroy state alone. Do not tell the user to run `tofu` themselves
+- Failed tofu apply is not Applied
+- File lock around apply/destroy
+- Required CI job installs OpenTofu, applies `examples/infra-tofu`, probes connections and the named bucket, `tofy run` injects `TOFY_*`, then destroys. Missing Docker or missing tofu **fails**
+- Phase 1 `scripts/ci-smoke.sh` stays the local Docker job and still requires Docker
+- No RDS, Multi-AZ, VPC, subnets, security groups, load balancers, IAM, or autoscaler
 
 ## Phase 3 — drift and polish
 
 - Drift: refresh live containers vs state, show a plan when reality diverged
-- Surface lock / drift in CI (provision CI is already phase 1)
+- Surface lock / drift in CI (provision CI is already phase 1 / 2)
 - Polish: errors, output formatting, docs
 
 ## Later
 
+- Remote AWS only with ambient credentials already on the machine (env / profile). No credential minting in tofy. Size tokens can map to instance class then
 - Importers into the same IR (not a write path; not auto-loaded)
 - More app-adjacent kinds
-- Optional live `PgPool` after apply for Rust apps that want it. Do not default to Shuttle. The consume path for other languages stays env.
+- Optional live `PgPool` after apply for Rust apps that want it. Do not default to Shuttle. The consume path for other languages stays env

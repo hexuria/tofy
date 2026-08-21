@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tofy_spec::{internal_host, Bind, Kind, Project, Resource, Size};
+use tofy_spec::{internal_host, Backend, Bind, Kind, Project, Resource, Size};
 
 use crate::error::Result;
 
@@ -38,6 +38,8 @@ fn default_replicas() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct State {
     pub project: String,
+    #[serde(default)]
+    pub backend: Backend,
     pub resources: BTreeMap<String, ResourceState>,
 }
 
@@ -68,6 +70,24 @@ impl State {
 
     pub fn clear_resources(&mut self) {
         self.resources.clear();
+    }
+
+    /// Rebuild a [`Project`] from persisted resource state (destroy / re-emit).
+    pub fn as_project(&self) -> Project {
+        let mut project = Project::new(&self.project);
+        project.backend = self.backend;
+        for (name, rs) in &self.resources {
+            project.resources.push(Resource {
+                name: name.clone(),
+                kind: rs.kind,
+                version: rs.version.clone(),
+                port: Some(rs.port),
+                size: rs.size,
+                bind: rs.bind,
+                replicas: rs.replicas,
+            });
+        }
+        project
     }
 }
 
@@ -125,6 +145,7 @@ pub fn prepare_state(spec: &Project, current: &State) -> State {
     }
     State {
         project: spec.project.clone(),
+        backend: spec.backend,
         resources,
     }
 }
@@ -293,6 +314,16 @@ mod tests {
             first.resources["cache"].outputs["uri"],
             second.resources["cache"].outputs["uri"]
         );
+    }
+
+    #[test]
+    fn prepare_copies_backend() {
+        let mut spec = postgres_spec();
+        spec.backend = Backend::Tofu;
+        let state = prepare_state(&spec, &State::default());
+        assert_eq!(state.backend, Backend::Tofu);
+        assert_eq!(state.as_project().backend, Backend::Tofu);
+        assert_eq!(state.as_project().resources[0].name, "appdb");
     }
 
     #[test]

@@ -2,85 +2,101 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use tofy_spec::{docker_network, Kind, Project};
+use tofy_spec::{docker_network, replica_volume, Backend, Kind, Project};
 
 use crate::error::Result;
-use crate::state::{docker_image, State};
+use crate::state::{docker_image, set_private, State};
 
 pub fn terraform_json(spec: &Project, state: &State) -> Value {
     let mut required = serde_json::Map::new();
     required.insert(
         "docker".into(),
-        json!({ "source": "kreuzwerker/docker", "version": "~> 3.0" }),
+        json!({ "source": "kreuzwerker/docker", "version": "~> 3.6" }),
     );
 
     let mut containers = serde_json::Map::new();
     let mut images = serde_json::Map::new();
-    let mut outputs = serde_json::Map::new();
+    let mut volumes = serde_json::Map::new();
     let net = docker_network(&spec.project);
 
     for r in &spec.resources {
         let image = docker_image(r);
         let key = sanitize(&r.name);
         images.insert(key.clone(), json!({ "name": image, "keep_locally": true }));
-        let outs = state
-            .resources
-            .get(&r.name)
-            .map(|s| s.outputs.clone())
-            .unwrap_or_default();
+        let rs = state.resources.get(&r.name);
+        let outs = rs.map(|s| s.outputs.clone()).unwrap_or_default();
+        let host_port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
         let (env, cmd) = container_env(r.kind, &outs);
         let mut c = json!({
             "name": format!("tofy-{}-{}", spec.project, r.name),
-            "image": image,
+            "image": format!("${{docker_image.{key}.image_id}}"),
+            "hostname": r.name,
+            "restart": "unless-stopped",
+            "must_run": true,
+            "memory": r.size.docker_memory_mb(),
+            "cpus": r.size.docker_cpus(),
             "ports": [{
                 "internal": r.kind.internal_port(),
-                "external": r.port_or_default(),
+                "external": host_port,
                 "ip": r.bind.as_ip(),
             }],
             "env": env,
-            "must_run": true,
-            "memory": r.size.docker_memory(),
-            "cpu_shares": match r.size.as_str() {
-                "small" => 256,
-                "medium" => 512,
-                _ => 1024,
-            },
             "networks_advanced": [{
-                "name": net,
+                "name": "${docker_network.stack.name}",
                 "aliases": [r.name.clone()],
             }],
+            "labels": [
+                { "label": "tofy.project", "value": spec.project },
+                { "label": "tofy.resource", "value": r.name },
+                { "label": "tofy.replica", "value": "1" },
+            ],
         });
         if let Some(cmd) = cmd {
             c["command"] = json!(cmd);
         }
-        containers.insert(key.clone(), c);
-
-        for (k, v) in &outs {
-            outputs.insert(
-                format!("{}_{}", key, sanitize(k)),
-                json!({
-                    "value": v,
-                    "sensitive": tofy_spec::is_secret_key(k),
-                }),
-            );
+        if matches!(r.kind, Kind::Postgres | Kind::Bucket) {
+            let vol = replica_volume(&spec.project, &r.name, 0);
+            volumes.insert(key.clone(), json!({ "name": vol }));
+            let mount = match r.kind {
+                Kind::Postgres => "/var/lib/postgresql/data",
+                Kind::Bucket => "/data",
+                Kind::Redis => unreachable!(),
+            };
+            c["volumes"] = json!([{
+                "volume_name": format!("${{docker_volume.{key}.name}}"),
+                "container_path": mount,
+            }]);
         }
+        containers.insert(key, c);
     }
 
-    json!({
-        "terraform": { "required_providers": required },
-        "provider": { "docker": { "host": "unix:///var/run/docker.sock" } },
-        "resource": {
-            "docker_network": {
+    let mut resource = serde_json::Map::new();
+    if !spec.resources.is_empty() {
+        resource.insert(
+            "docker_network".into(),
+            json!({
                 "stack": {
                     "name": net,
                     "labels": [{ "label": "tofy.project", "value": spec.project }],
                 }
-            },
-            "docker_image": images,
-            "docker_container": containers,
-        },
-        "output": outputs,
+            }),
+        );
+        resource.insert("docker_image".into(), Value::Object(images));
+        if !volumes.is_empty() {
+            resource.insert("docker_volume".into(), Value::Object(volumes));
+        }
+        resource.insert("docker_container".into(), Value::Object(containers));
+    }
+
+    json!({
+        "terraform": { "required_providers": required },
+        "provider": { "docker": { "host": docker_host() } },
+        "resource": resource,
     })
+}
+
+fn docker_host() -> String {
+    std::env::var("DOCKER_HOST").unwrap_or_else(|_| "unix:///var/run/docker.sock".into())
 }
 
 pub fn compose_yaml(spec: &Project, state: &State) -> String {
@@ -132,20 +148,39 @@ pub fn compose_yaml(spec: &Project, state: &State) -> String {
 
 /// Write the language-agnostic spec JSON only.
 ///
-/// Apply does **not** write `docker-compose.yml` or `main.tf.json`. Those
-/// would embed live passwords and object-store keys. Secrets live in
-/// `.tofy/state.json` and outputs (mode `0600`).
+/// Local apply does **not** write `docker-compose.yml` or `main.tf.json`.
+/// Those would embed live passwords as a world-readable default artifact.
+/// The OpenTofu backend writes `main.tf.json` separately (mode `0600`).
 pub fn write_artifacts(root: &Path, spec: &Project, _state: &State) -> Result<()> {
     let dir = root.join(".tofy");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("spec.json"), spec.to_json_pretty()?)?;
-    // Drop leftover secret-bearing artifacts from older applies.
-    for name in ["docker-compose.yml", "main.tf.json"] {
+    let mut leftover = vec!["docker-compose.yml"];
+    if spec.backend != Backend::Tofu {
+        leftover.push("main.tf.json");
+    }
+    for name in leftover {
         let p = dir.join(name);
         if p.exists() {
             std::fs::remove_file(p)?;
         }
     }
+    Ok(())
+}
+
+/// OpenTofu docker-provider config. Contains secrets; mode `0600`, under `.tofy/`.
+pub fn write_tofu_config(root: &Path, spec: &Project, state: &State) -> Result<()> {
+    let dir = root.join(".tofy");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("main.tf.json");
+    let tmp = dir.join("main.tf.json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&terraform_json(spec, state))?,
+    )?;
+    set_private(&tmp)?;
+    std::fs::rename(&tmp, &path)?;
+    set_private(&path)?;
     Ok(())
 }
 
@@ -175,7 +210,17 @@ fn container_env(
             ],
             None,
         ),
-        Kind::Redis => (vec![], None),
+        Kind::Redis => {
+            let password = outs.get("password").map(String::as_str).unwrap_or("");
+            (
+                vec![],
+                Some(vec![
+                    "redis-server".into(),
+                    "--requirepass".into(),
+                    password.into(),
+                ]),
+            )
+        }
         Kind::Bucket => (
             vec![
                 format!(
@@ -220,6 +265,53 @@ mod tests {
         assert_eq!(containers.len(), 2);
         assert!(containers.contains_key("cache"));
         assert!(containers.contains_key("uploads"));
+        let cache_cmd = tf["resource"]["docker_container"]["cache"]["command"]
+            .as_array()
+            .expect("redis command");
+        assert_eq!(cache_cmd[0], "redis-server");
+        assert_eq!(cache_cmd[1], "--requirepass");
+        assert!(!cache_cmd[2].as_str().unwrap_or("").is_empty());
+        assert!(tf["resource"]["docker_volume"]
+            .as_object()
+            .unwrap()
+            .contains_key("uploads"));
+        assert!(!tf["resource"]["docker_volume"]
+            .as_object()
+            .unwrap()
+            .contains_key("cache"));
+        assert_eq!(tf["resource"]["docker_container"]["cache"]["memory"], 256);
+        assert_eq!(tf["resource"]["docker_container"]["cache"]["cpus"], "0.25");
+    }
+
+    #[test]
+    fn terraform_json_postgres_volume_and_bind() {
+        let mut spec = Project::new("demo");
+        spec.resources.push(
+            Resource::new("appdb", Kind::Postgres)
+                .with_port(5433)
+                .with_size(tofy_spec::Size::Medium),
+        );
+        let state = prepare_state(&spec, &State::default());
+        let tf = terraform_json(&spec, &state);
+        let c = &tf["resource"]["docker_container"]["appdb"];
+        assert_eq!(c["ports"][0]["external"], 5433);
+        assert_eq!(c["ports"][0]["ip"], "127.0.0.1");
+        assert_eq!(c["memory"], 512);
+        assert_eq!(c["cpus"], "0.50");
+        assert_eq!(
+            tf["resource"]["docker_volume"]["appdb"]["name"],
+            "tofy-demo-appdb-data"
+        );
+        assert_eq!(
+            c["volumes"][0]["container_path"],
+            "/var/lib/postgresql/data"
+        );
+        assert_eq!(c["hostname"], "appdb");
+        assert!(c["networks_advanced"][0]["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "appdb"));
     }
 
     #[test]
@@ -238,5 +330,33 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".tofy").join("spec.json")).unwrap();
         assert!(!spec_text.to_lowercase().contains("password"));
         assert!(!spec_text.contains("POSTGRES_PASSWORD"));
+    }
+
+    #[test]
+    fn tofu_config_is_mode_0600_and_gitignored_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = Project::new("demo");
+        spec.backend = tofy_spec::Backend::Tofu;
+        spec.resources.push(Resource::new("cache", Kind::Redis));
+        spec.resources.push(Resource::new("uploads", Kind::Bucket));
+        let state = prepare_state(&spec, &State::default());
+        write_tofu_config(dir.path(), &spec, &state).unwrap();
+        let path = dir.path().join(".tofy").join("main.tf.json");
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("requirepass"));
+        assert!(text.contains("/data"));
+        assert!(text.contains("kreuzwerker/docker"));
+        write_artifacts(dir.path(), &spec, &state).unwrap();
+        assert!(
+            path.exists(),
+            "local leftover cleanup must not drop tofu config"
+        );
     }
 }

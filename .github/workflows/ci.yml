@@ -46,3 +46,44 @@ jobs:
 
       - name: Apply, probe, and destroy
         run: bash scripts/ci-smoke.sh
+
+  test-and-apply-tofu:
+    name: test and tofu apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.83.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tofu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tofu-
+            ${{ runner.os }}-cargo-
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Require Docker
+        run: docker info
+
+      - name: Require OpenTofu
+        run: tofu version
+
+      - name: Install host probe clients
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client redis-tools
+
+      - name: Apply, probe, and destroy (OpenTofu backend)
+        run: bash scripts/ci-smoke-tofu.sh

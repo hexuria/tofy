@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use tofy_spec::{Bind, Kind, Project, Resource, Size};
+use tofy_spec::{Backend, Bind, Kind, Project, Resource, Size};
 
 thread_local! {
     static OPEN_STACK: Cell<bool> = const { Cell::new(false) };
@@ -189,6 +189,18 @@ pub struct Stack<S> {
 }
 
 impl Stack<Empty> {
+    /// Select the apply engine. Default is [`Backend::Local`] (Docker).
+    /// Illegal after `add` — this method exists only on [`Stack<Empty>`].
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.project.backend = backend;
+        self
+    }
+
+    /// `stack("demo").backend(Backend::Tofu)`.
+    pub fn tofu(self) -> Self {
+        self.backend(Backend::Tofu)
+    }
+
     pub fn add(mut self, resource: impl ResourceDecl) -> Stack<NonEmpty> {
         self.project.resources.push(resource.into());
         Stack {
@@ -342,6 +354,7 @@ mod tests {
         let files = bucket("uploads");
         let project = stack("demo").add(db).add(cache).add(files).into_project();
         assert_eq!(project.project, "demo");
+        assert_eq!(project.backend, Backend::Local);
         assert_eq!(project.docker_network(), "tofy-demo");
         assert_eq!(project.resources.len(), 3);
         assert_eq!(project.resources[0].name, "appdb");
@@ -354,5 +367,22 @@ mod tests {
         assert_eq!(project.resources[1].size, Size::Medium);
         assert_eq!(project.resources[2].kind, Kind::Bucket);
         assert_eq!(project.resources[2].replicas, 1);
+    }
+
+    #[test]
+    fn backend_selector_on_empty() {
+        let via_enum = stack("demo")
+            .backend(Backend::Tofu)
+            .add(postgres("appdb"))
+            .into_project();
+        assert_eq!(via_enum.backend, Backend::Tofu);
+        assert_eq!(via_enum.resources[0].name, "appdb");
+        let via_tofu = stack("demo").tofu().add(redis("cache")).into_project();
+        assert_eq!(via_tofu.backend, Backend::Tofu);
+        let local = stack("demo")
+            .backend(Backend::Local)
+            .add(bucket("uploads"))
+            .into_project();
+        assert_eq!(local.backend, Backend::Local);
     }
 }
