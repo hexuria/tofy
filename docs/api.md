@@ -66,6 +66,7 @@ After apply, other languages **do not** import tofy.
 
 - `tofy run -- <cmd>` injects `TOFY_*` and execs
 - or read `.tofy/outputs.env` / `.tofy/outputs.json`
+- Rust-only opt-in: crate `tofy-pg` (`pool_from_env` / `pool_from_outputs`) plus `Stack<Applied>::uri(&self, name)` which returns the host URI string. `#[tofy::main]` stays sync. Other languages stay on env.
 
 `TOFY_APPDB_URI` is the host URI for the laptop. On local / Tofu that is loopback; a sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`). Redis is the same shape with a password: local / Tofu `TOFY_CACHE_URI` is `redis://:<password>@127.0.0.1:…`. On `Backend::Aws`, `TOFY_APPDB_URI` is the RDS endpoint (reachable from the applying machine) and `TOFY_CACHE_URI` is `rediss://:<password>@<elasticache-host>:…` (TLS). That Redis URI is for in-VPC or VPN clients — ElastiCache is not reachable from the public internet.
 

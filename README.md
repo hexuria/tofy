@@ -98,6 +98,8 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 | `cache` (redis) | Local / Tofu: `TOFY_CACHE_URI` (`redis://:<password>@127.0.0.1:…`), `TOFY_CACHE_PASSWORD`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*`. Aws: `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS; ElastiCache AUTH) |
 | `uploads` (bucket) | Local / Tofu: `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*`. Aws: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT` (no minted keys) |
 
+Rust apps that want a live pool can add `tofy-pg` and call `pool_from_env("TOFY_APPDB_URI")` (or `pool_from_outputs`). That is opt-in. Other languages keep reading env. `#[tofy::main]` stays sync.
+
 **Host vs in-stack.** `tofy run` and processes on the laptop use loopback (`TOFY_APPDB_URI=postgres://…@127.0.0.1:5433/…`) on the local and Tofu docker backends. Another container on the private network uses the resource DNS name and the container port (`TOFY_APPDB_INTERNAL_URI=postgres://…@appdb:5432/…`). On `Backend::Aws`, host `TOFY_*_URI` / `TOFY_*_HOST` are the RDS / ElastiCache / S3 endpoints (not `127.0.0.1`). RDS is reachable from the applying laptop. ElastiCache is VPC-only, so `TOFY_CACHE_URI` (`rediss://`) is for in-VPC or VPN clients.
 
 ``.tofy/` is gitignored. Do not commit `state.json`, `outputs.env`, `main.tf.json`, tofu state, or secrets.

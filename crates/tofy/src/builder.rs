@@ -312,6 +312,17 @@ impl Stack<NonEmpty> {
 }
 
 impl Stack<Applied> {
+    /// Host URI for a resource (`TOFY_<NAME>_URI`) from `.tofy/outputs.json`.
+    /// Does not open a client. Opt-in `tofy-pg` can turn this into a `PgPool`.
+    pub fn uri(&self, name: &str) -> crate::Result<String> {
+        let root = workdir();
+        let map = crate::outputs::load(&root)?;
+        let key = tofy_spec::env_var(name, "uri");
+        map.get(&key)
+            .cloned()
+            .ok_or_else(|| crate::error::Error::Engine(format!("no URI for resource {name}")))
+    }
+
     /// Print non-secret outputs (`tofy output`).
     pub fn output(self) {
         let root = workdir();
