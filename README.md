@@ -95,7 +95,7 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 | `cache` (redis) | Local / Tofu: `TOFY_CACHE_URI` (`redis://:<password>@127.0.0.1:…`), `TOFY_CACHE_PASSWORD`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*`. Aws: `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS; ElastiCache AUTH) |
 | `uploads` (bucket) | Local / Tofu: `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*`. Aws: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT` (no minted keys) |
 
-**Host vs in-stack.** `tofy run` and processes on the laptop use loopback (`TOFY_APPDB_URI=postgres://…@127.0.0.1:5433/…`). Another container on the private network uses the resource DNS name and the container port (`TOFY_APPDB_INTERNAL_URI=postgres://…@appdb:5432/…`).
+**Host vs in-stack.** `tofy run` and processes on the laptop use loopback (`TOFY_APPDB_URI=postgres://…@127.0.0.1:5433/…`) on the local and Tofu docker backends. Another container on the private network uses the resource DNS name and the container port (`TOFY_APPDB_INTERNAL_URI=postgres://…@appdb:5432/…`). On `Backend::Aws`, host `TOFY_*_URI` / `TOFY_*_HOST` are the RDS / ElastiCache / S3 endpoints (not `127.0.0.1`). RDS is reachable from the applying laptop. ElastiCache is VPC-only, so `TOFY_CACHE_URI` (`rediss://`) is for in-VPC or VPN clients.
 
 ``.tofy/` is gitignored. Do not commit `state.json`, `outputs.env`, `main.tf.json`, tofu state, or secrets.
 
@@ -113,7 +113,9 @@ The local backend has no HA. There is no `.replicas()` on `postgres`, `redis`, o
 
 `.bind(Bind::Localhost)` (default) or `.bind(Bind::All)` (`0.0.0.0`) is who can reach the **published** port. In-stack traffic still uses the private network. Redis always has `requirepass` (password in `TOFY_CACHE_PASSWORD` / URI) so `Bind::All` is not an open unauthenticated Redis.
 
-The Aws backend maps the same tokens to RDS / ElastiCache instance class and S3 `STANDARD`. It does not add instance-class, replica, or networking methods to the builders.
+On `Backend::Aws`, `Bind::Localhost` does **not** mean bind `127.0.0.1` on RDS / ElastiCache. It means SG ingress from the applying machine's public IPv4 `/32` only — not the whole internet. At plan / apply / emit, tofy discovers that machine's public IPv4 (or `TOFY_APPLIER_CIDR` when set) and emits a tofy-owned security group in the account default VPC with ingress for postgres / redis from that `/32`. It does not fall back to `0.0.0.0/0`. RDS is `publicly_accessible` so the postgres host URI works from that laptop. ElastiCache has no public IP, so Redis stays inside the VPC (or VPN) even with the same SG. `Bind::All` opens SG ingress to `0.0.0.0/0` (still AUTH + TLS for Redis; still not a public Redis endpoint). The default example stays `Localhost`. The discovered `/32` is stored in `.tofy/state.json` so a later plan from a new IP shows an SG-rule update.
+
+The Aws backend maps the same tokens to RDS / ElastiCache instance class and S3 `STANDARD`. It does not add instance-class, replica, or networking methods to the builders. Networking is the account default VPC plus a tofy-owned security group (not a user `.securityGroup()` / `.cidr()` / `.publiclyAccessible()`).
 
 ## CI
 
@@ -123,7 +125,7 @@ Three required jobs on GitHub-hosted `ubuntu-latest`. rustc is pinned to 1.83 (`
 
 **OpenTofu docker engine** (`scripts/ci-smoke-tofu.sh`): installs OpenTofu, then `cargo run -p infra-tofu` (`stack("demotofu").backend(Backend::Tofu)…` on 15433 / 16379 / 19000). `tofy plan` must print the OpenTofu engine plan, not only the house `Plan:` / `+ create` format. Missing Docker or missing tofu **fails**.
 
-**AWS OpenTofu config** (`scripts/ci-smoke-aws.sh`): unit tests, emit `examples/infra-aws` (`stack("demoaws").backend(Backend::Aws)…`), `tofu init` + `tofu validate`, and prove missing-creds apply / plan do not claim Applied or `No changes.`. Does **not** live-apply AWS. Missing tofu **fails**. Skip-as-success would be a lie.
+**AWS OpenTofu config** (`scripts/ci-smoke-aws.sh`): unit tests, emit `examples/infra-aws` (`stack("demoaws").backend(Backend::Aws)…`), `tofu init` + `tofu validate`, assert the tofy SG ingress is a `/32`, and prove missing-creds apply / plan do not claim Applied or `No changes.`. Does **not** live-apply AWS. Missing tofu **fails**. Skip-as-success would be a lie.
 
 Both jobs:
 

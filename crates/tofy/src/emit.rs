@@ -172,13 +172,25 @@ pub fn write_artifacts(root: &Path, spec: &Project, _state: &State) -> Result<()
 
 /// OpenTofu config for the selected engine. Contains secrets; mode `0600`, under `.tofy/`.
 /// `Backend::Tofu` is the docker provider. `Backend::Aws` is the AWS provider.
-pub fn write_tofu_config(root: &Path, spec: &Project, state: &State) -> Result<()> {
+pub fn write_tofu_config(root: &Path, spec: &Project, state: &mut State) -> Result<()> {
+    write_tofu_config_mode(root, spec, state, aws::CidrMode::Rediscover)
+}
+
+pub(crate) fn write_tofu_config_mode(
+    root: &Path,
+    spec: &Project,
+    state: &mut State,
+    mode: aws::CidrMode,
+) -> Result<()> {
+    if spec.backend == Backend::Aws {
+        aws::prepare_emit(spec, state, mode)?;
+    }
     let dir = root.join(".tofy");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("main.tf.json");
     let tmp = dir.join("main.tf.json.tmp");
     let body = match spec.backend {
-        Backend::Aws => aws_terraform_json(spec, state),
+        Backend::Aws => aws_terraform_json(spec, state)?,
         Backend::Tofu | Backend::Local => terraform_json(spec, state),
     };
     std::fs::write(&tmp, serde_json::to_string_pretty(&body)?)?;
@@ -190,7 +202,11 @@ pub fn write_tofu_config(root: &Path, spec: &Project, state: &State) -> Result<(
 
 /// AWS-provider OpenTofu JSON. Uses the account default VPC via data sources.
 /// Does not create a VPC, subnet, load balancer, IAM user, or autoscaler.
-pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
+/// Postgres / Redis get a tofy-owned security group. `Bind::Localhost` is the
+/// applying machine's public IPv4 `/32`, not `127.0.0.1`. RDS is publicly
+/// reachable from that `/32`. ElastiCache has no public IP, so Redis stays
+/// VPC-only even with the same SG.
+pub fn aws_terraform_json(spec: &Project, state: &State) -> Result<Value> {
     let mut required = serde_json::Map::new();
     required.insert(
         "aws".into(),
@@ -208,10 +224,7 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
     let mut resource = serde_json::Map::new();
     let mut outputs = serde_json::Map::new();
 
-    let needs_vpc = spec
-        .resources
-        .iter()
-        .any(|r| matches!(r.kind, Kind::Postgres | Kind::Redis));
+    let needs_vpc = aws::needs_engine_sg(spec);
     if needs_vpc {
         data.insert(
             "aws_vpc".into(),
@@ -230,24 +243,26 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
                 }
             }),
         );
-        data.insert(
-            "aws_security_group".into(),
-            json!({
-                "default": {
-                    "name": "default",
-                    "vpc_id": "${data.aws_vpc.default.id}"
-                }
-            }),
-        );
     }
     data.insert("aws_caller_identity".into(), json!({ "current": {} }));
     data.insert("aws_region".into(), json!({ "current": {} }));
+
+    let applier_cidr = if aws::needs_applier_cidr(spec) {
+        let cidr = state
+            .applier_cidr
+            .as_deref()
+            .ok_or(crate::error::Error::PublicIpv4Undetermined)?;
+        Some(cidr)
+    } else {
+        None
+    };
 
     let mut db_instances = serde_json::Map::new();
     let mut db_subnet_groups = serde_json::Map::new();
     let mut cache_groups = serde_json::Map::new();
     let mut cache_subnet_groups = serde_json::Map::new();
     let mut buckets = serde_json::Map::new();
+    let mut sg_ingress = serde_json::Map::new();
 
     for r in &spec.resources {
         let key = sanitize(&r.name);
@@ -263,6 +278,17 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
                     .cloned()
                     .unwrap_or_else(|| r.name.replace('-', "_"));
                 let port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
+                sg_ingress.insert(
+                    key.clone(),
+                    json!({
+                        "security_group_id": "${aws_security_group.tofy.id}",
+                        "cidr_ipv4": ingress_cidr(r.bind, applier_cidr)?,
+                        "from_port": port,
+                        "to_port": port,
+                        "ip_protocol": "tcp",
+                        "description": format!("tofy postgres {}", r.name),
+                    }),
+                );
                 db_subnet_groups.insert(
                     key.clone(),
                     json!({
@@ -285,8 +311,8 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
                         "db_name": database,
                         "port": port,
                         "db_subnet_group_name": format!("${{aws_db_subnet_group.{key}.name}}"),
-                        "vpc_security_group_ids": ["${data.aws_security_group.default.id}"],
-                        "publicly_accessible": r.bind == Bind::All,
+                        "vpc_security_group_ids": ["${aws_security_group.tofy.id}"],
+                        "publicly_accessible": true,
                         "multi_az": false,
                         "backup_retention_period": 0,
                         "skip_final_snapshot": true,
@@ -307,6 +333,17 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
             Kind::Redis => {
                 let password = outs.get("password").cloned().unwrap_or_default();
                 let port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
+                sg_ingress.insert(
+                    key.clone(),
+                    json!({
+                        "security_group_id": "${aws_security_group.tofy.id}",
+                        "cidr_ipv4": ingress_cidr(r.bind, applier_cidr)?,
+                        "from_port": port,
+                        "to_port": port,
+                        "ip_protocol": "tcp",
+                        "description": format!("tofy redis {}", r.name),
+                    }),
+                );
                 cache_subnet_groups.insert(
                     key.clone(),
                     json!({
@@ -327,7 +364,7 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
                         "port": port,
                         "parameter_group_name": redis_parameter_group(r.version_or_default()),
                         "subnet_group_name": format!("${{aws_elasticache_subnet_group.{key}.name}}"),
-                        "security_group_ids": ["${data.aws_security_group.default.id}"],
+                        "security_group_ids": ["${aws_security_group.tofy.id}"],
                         "automatic_failover_enabled": false,
                         "multi_az_enabled": false,
                         "transit_encryption_enabled": true,
@@ -380,8 +417,41 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
         }
     }
 
+    if needs_vpc {
+        resource.insert(
+            "aws_security_group".into(),
+            json!({
+                "tofy": {
+                    "name": format!("tofy-{}", aws::aws_token(&spec.project)),
+                    "description": "tofy applier access to postgres and redis",
+                    "vpc_id": "${data.aws_vpc.default.id}",
+                    "tags": {
+                        "tofy.project": spec.project,
+                        "tofy.role": "applier"
+                    },
+                }
+            }),
+        );
+        resource.insert(
+            "aws_vpc_security_group_ingress_rule".into(),
+            Value::Object(sg_ingress),
+        );
+        resource.insert(
+            "aws_vpc_security_group_egress_rule".into(),
+            json!({
+                "all": {
+                    "security_group_id": "${aws_security_group.tofy.id}",
+                    "cidr_ipv4": "0.0.0.0/0",
+                    "ip_protocol": "-1",
+                }
+            }),
+        );
+    }
     if !db_instances.is_empty() {
-        resource.insert("aws_db_subnet_group".into(), Value::Object(db_subnet_groups));
+        resource.insert(
+            "aws_db_subnet_group".into(),
+            Value::Object(db_subnet_groups),
+        );
         resource.insert("aws_db_instance".into(), Value::Object(db_instances));
     }
     if !cache_groups.is_empty() {
@@ -398,13 +468,20 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Value {
         resource.insert("aws_s3_bucket".into(), Value::Object(buckets));
     }
 
-    json!({
+    Ok(json!({
         "terraform": { "required_providers": required },
         "provider": provider,
         "data": data,
         "resource": resource,
         "output": outputs,
-    })
+    }))
+}
+
+fn ingress_cidr<'a>(bind: Bind, applier: Option<&'a str>) -> Result<&'a str> {
+    match bind {
+        Bind::Localhost => applier.ok_or(crate::error::Error::PublicIpv4Undetermined),
+        Bind::All => Ok("0.0.0.0/0"),
+    }
 }
 
 fn postgres_engine_version(version: &str) -> String {
@@ -594,7 +671,7 @@ mod tests {
         spec.resources.push(Resource::new("cache", Kind::Redis));
         spec.resources.push(Resource::new("uploads", Kind::Bucket));
         let state = prepare_state(&spec, &State::default());
-        write_tofu_config(dir.path(), &spec, &state).unwrap();
+        write_tofu_config(dir.path(), &spec, &mut state.clone()).unwrap();
         let path = dir.path().join(".tofy").join("main.tf.json");
         assert!(path.exists());
         #[cfg(unix)]
@@ -625,19 +702,24 @@ mod tests {
         spec.resources
             .push(Resource::new("cache", Kind::Redis).with_port(26379));
         spec.resources.push(Resource::new("uploads", Kind::Bucket));
-        let state = prepare_state(&spec, &State::default());
+        let mut state = prepare_state(&spec, &State::default());
+        state.applier_cidr = Some("203.0.113.10/32".into());
         (spec, state)
     }
+
+    const APPLIER: &str = "203.0.113.10/32";
 
     #[test]
     fn aws_terraform_json_uses_aws_provider_not_docker() {
         let (spec, state) = aws_spec();
-        let tf = aws_terraform_json(&spec, &state);
+        let tf = aws_terraform_json(&spec, &state).unwrap();
         assert_eq!(
             tf["terraform"]["required_providers"]["aws"]["source"],
             "hashicorp/aws"
         );
-        assert!(tf["terraform"]["required_providers"].get("docker").is_none());
+        assert!(tf["terraform"]["required_providers"]
+            .get("docker")
+            .is_none());
         assert!(tf["provider"].get("docker").is_none());
         assert!(tf["resource"].get("docker_container").is_none());
         assert!(tf["resource"].get("aws_vpc").is_none());
@@ -651,13 +733,26 @@ mod tests {
         assert_eq!(db["instance_class"], "db.t4g.small");
         assert_eq!(db["engine"], "postgres");
         assert_eq!(db["multi_az"], false);
-        assert_eq!(db["publicly_accessible"], false);
-        assert!(
-            db["vpc_security_group_ids"][0]
-                .as_str()
-                .unwrap()
-                .contains("data.aws_security_group.default"),
-            "{db}"
+        assert_eq!(db["publicly_accessible"], true);
+        assert_eq!(
+            db["vpc_security_group_ids"][0],
+            "${aws_security_group.tofy.id}"
+        );
+        let sg = &tf["resource"]["aws_security_group"]["tofy"];
+        assert_eq!(sg["vpc_id"], "${data.aws_vpc.default.id}");
+        assert!(sg["name"].as_str().unwrap().starts_with("tofy-"));
+        let ingress = &tf["resource"]["aws_vpc_security_group_ingress_rule"];
+        assert_eq!(ingress["appdb"]["cidr_ipv4"], APPLIER);
+        assert_eq!(ingress["cache"]["cidr_ipv4"], APPLIER);
+        assert_eq!(ingress["appdb"]["from_port"], 25432);
+        assert_eq!(ingress["cache"]["from_port"], 26379);
+        assert!(!ingress["appdb"]["cidr_ipv4"]
+            .as_str()
+            .unwrap()
+            .contains("0.0.0.0/0"));
+        assert_eq!(
+            tf["resource"]["aws_elasticache_replication_group"]["cache"]["security_group_ids"][0],
+            "${aws_security_group.tofy.id}"
         );
         assert_eq!(
             tf["resource"]["aws_elasticache_replication_group"]["cache"]["node_type"],
@@ -672,7 +767,8 @@ mod tests {
             false
         );
         assert_eq!(
-            tf["resource"]["aws_elasticache_replication_group"]["cache"]["transit_encryption_enabled"],
+            tf["resource"]["aws_elasticache_replication_group"]["cache"]
+                ["transit_encryption_enabled"],
             true
         );
         let password = state.resources["cache"].outputs["password"].as_str();
@@ -695,8 +791,10 @@ mod tests {
     #[test]
     fn aws_config_is_mode_0600_and_local_cleanup_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (spec, state) = aws_spec();
-        write_tofu_config(dir.path(), &spec, &state).unwrap();
+        let (spec, mut state) = aws_spec();
+        crate::aws::with_applier_cidr(APPLIER, || {
+            write_tofu_config(dir.path(), &spec, &mut state).unwrap();
+        });
         let path = dir.path().join(".tofy").join("main.tf.json");
         assert!(path.exists());
         #[cfg(unix)]
@@ -712,20 +810,23 @@ mod tests {
         assert!(parsed["resource"].get("aws_vpc").is_none());
         assert!(parsed["data"]["aws_vpc"]["default"]["default"] == true);
         write_artifacts(dir.path(), &spec, &state).unwrap();
-        assert!(path.exists(), "emit leftover cleanup must keep AWS tofu config");
+        assert!(
+            path.exists(),
+            "emit leftover cleanup must keep AWS tofu config"
+        );
     }
 
     #[test]
     fn aws_size_large_maps_instance_class() {
         let mut spec = Project::new("demoaws");
         spec.backend = Backend::Aws;
-        spec.resources.push(
-            Resource::new("appdb", Kind::Postgres).with_size(tofy_spec::Size::Large),
-        );
+        spec.resources
+            .push(Resource::new("appdb", Kind::Postgres).with_size(tofy_spec::Size::Large));
         spec.resources
             .push(Resource::new("cache", Kind::Redis).with_size(tofy_spec::Size::Large));
-        let state = prepare_state(&spec, &State::default());
-        let tf = aws_terraform_json(&spec, &state);
+        let mut state = prepare_state(&spec, &State::default());
+        state.applier_cidr = Some(APPLIER.into());
+        let tf = aws_terraform_json(&spec, &state).unwrap();
         assert_eq!(
             tf["resource"]["aws_db_instance"]["appdb"]["instance_class"],
             "db.t4g.medium"
@@ -733,6 +834,107 @@ mod tests {
         assert_eq!(
             tf["resource"]["aws_elasticache_replication_group"]["cache"]["node_type"],
             "cache.t4g.medium"
+        );
+    }
+
+    #[test]
+    fn aws_localhost_sg_is_applier_slash32_not_world() {
+        let (spec, state) = aws_spec();
+        let tf = aws_terraform_json(&spec, &state).unwrap();
+        let ingress = tf["resource"]["aws_vpc_security_group_ingress_rule"]
+            .as_object()
+            .unwrap();
+        for (name, rule) in ingress {
+            let cidr = rule["cidr_ipv4"].as_str().unwrap();
+            assert!(cidr.ends_with("/32"), "{name} cidr={cidr}");
+            assert_ne!(cidr, "0.0.0.0/0", "{name}");
+        }
+        assert!(tf["resource"].get("aws_vpc").is_none());
+        assert_eq!(tf["data"]["aws_vpc"]["default"]["default"], true);
+        assert!(tf["data"].get("aws_security_group").is_none());
+        let bucket = tf["resource"]["aws_s3_bucket"]["uploads"]["bucket"]
+            .as_str()
+            .unwrap();
+        assert!(bucket.starts_with("tofy-demoaws-uploads-"), "{bucket}");
+        assert!(tf["resource"].get("aws_iam_user").is_none());
+    }
+
+    #[test]
+    fn aws_bind_all_ingress_is_everywhere() {
+        let mut spec = Project::new("demoaws");
+        spec.backend = Backend::Aws;
+        spec.resources
+            .push(Resource::new("appdb", Kind::Postgres).with_bind(tofy_spec::Bind::All));
+        spec.resources
+            .push(Resource::new("cache", Kind::Redis).with_bind(tofy_spec::Bind::All));
+        let state = prepare_state(&spec, &State::default());
+        assert!(state.applier_cidr.is_none());
+        let tf = aws_terraform_json(&spec, &state).unwrap();
+        assert_eq!(
+            tf["resource"]["aws_vpc_security_group_ingress_rule"]["appdb"]["cidr_ipv4"],
+            "0.0.0.0/0"
+        );
+        assert_eq!(
+            tf["resource"]["aws_vpc_security_group_ingress_rule"]["cache"]["cidr_ipv4"],
+            "0.0.0.0/0"
+        );
+        assert_eq!(
+            tf["resource"]["aws_db_instance"]["appdb"]["publicly_accessible"],
+            true
+        );
+    }
+
+    #[test]
+    fn aws_s3_only_has_no_sg_and_skips_public_ip() {
+        let mut spec = Project::new("demoaws");
+        spec.backend = Backend::Aws;
+        spec.resources.push(Resource::new("uploads", Kind::Bucket));
+        let state = prepare_state(&spec, &State::default());
+        let tf = aws_terraform_json(&spec, &state).unwrap();
+        assert!(tf["resource"].get("aws_security_group").is_none());
+        assert!(tf["resource"]
+            .get("aws_vpc_security_group_ingress_rule")
+            .is_none());
+        assert!(tf["resource"].get("aws_db_instance").is_none());
+        assert!(tf["resource"].get("aws_vpc").is_none());
+        assert!(tf["resource"].get("aws_s3_bucket").is_some());
+        assert!(tf["data"].get("aws_vpc").is_none());
+    }
+
+    #[test]
+    fn aws_missing_public_ip_errors_and_does_not_open_the_world() {
+        let mut spec = Project::new("demoaws");
+        spec.backend = Backend::Aws;
+        spec.resources.push(Resource::new("appdb", Kind::Postgres));
+        let state = prepare_state(&spec, &State::default());
+        let err = aws_terraform_json(&spec, &state).unwrap_err();
+        assert!(matches!(err, crate::error::Error::PublicIpv4Undetermined));
+        crate::aws::with_public_ip_undetermined(|| {
+            let mut state = prepare_state(&spec, &State::default());
+            let dir = tempfile::tempdir().unwrap();
+            let err = write_tofu_config(dir.path(), &spec, &mut state).unwrap_err();
+            assert!(matches!(err, crate::error::Error::PublicIpv4Undetermined));
+            assert!(!dir.path().join(".tofy").join("main.tf.json").exists());
+        });
+    }
+
+    #[test]
+    fn aws_applier_ip_change_updates_sg_ingress() {
+        let (spec, mut state) = aws_spec();
+        let first = aws_terraform_json(&spec, &state).unwrap();
+        state.applier_cidr = Some("198.51.100.20/32".into());
+        let second = aws_terraform_json(&spec, &state).unwrap();
+        assert_eq!(
+            first["resource"]["aws_vpc_security_group_ingress_rule"]["appdb"]["cidr_ipv4"],
+            "203.0.113.10/32"
+        );
+        assert_eq!(
+            second["resource"]["aws_vpc_security_group_ingress_rule"]["appdb"]["cidr_ipv4"],
+            "198.51.100.20/32"
+        );
+        assert_eq!(
+            first["resource"]["aws_s3_bucket"]["uploads"]["bucket"],
+            second["resource"]["aws_s3_bucket"]["uploads"]["bucket"]
         );
     }
 }

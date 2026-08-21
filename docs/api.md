@@ -19,7 +19,7 @@ The written source is Rust. Builders are typestate: every builder is `Foo<S>` wi
 | `Bucket<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
 
 `size` takes `Size { Small, Medium, Large }`, not a loose string.  
-`bind` takes `Bind::Localhost` (`127.0.0.1`) or `Bind::All` (`0.0.0.0`).
+`bind` takes `Bind::Localhost` (`127.0.0.1` on Docker backends) or `Bind::All` (`0.0.0.0`). On `Backend::Aws`, `Localhost` is SG ingress from the applying machine's public IPv4 `/32` (not loopback, not a silent `0.0.0.0/0`); `All` opens SG ingress to `0.0.0.0/0`. RDS is publicly reachable from that CIDR. ElastiCache has no public IP, so Redis stays VPC-only even with the same SG.
 
 The local backend has no HA. `replicas` is not a method on any Open builder. If the IR has `replicas > 1` on any kind, apply fails with `local backend has no HA`. The IR field stays (default 1) for a later backend.
 
@@ -64,7 +64,7 @@ After apply, other languages **do not** import tofy.
 - `tofy run -- <cmd>` injects `TOFY_*` and execs
 - or read `.tofy/outputs.env` / `.tofy/outputs.json`
 
-`TOFY_APPDB_URI` is the host loopback URI for the laptop. A sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`). Redis is the same shape with a password: `TOFY_CACHE_URI` is `redis://:<password>@127.0.0.1:…` and `TOFY_CACHE_PASSWORD` is the secret.
+`TOFY_APPDB_URI` is the host URI for the laptop. On local / Tofu that is loopback; a sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`). Redis is the same shape with a password: local / Tofu `TOFY_CACHE_URI` is `redis://:<password>@127.0.0.1:…`. On `Backend::Aws`, `TOFY_APPDB_URI` is the RDS endpoint (reachable from the applying machine) and `TOFY_CACHE_URI` is `rediss://:<password>@<elasticache-host>:…` (TLS). That Redis URI is for in-VPC or VPN clients — ElastiCache is not reachable from the public internet.
 
 The JSON IR (`Project` / `Resource` / `Kind` / `Backend` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
 
@@ -81,3 +81,5 @@ Language stays `postgres` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`,
 | `bucket` | S3 | `STANDARD` | `STANDARD` | `STANDARD` |
 
 Postgres / Redis passwords are generated once and persisted like the local backend. After apply, `TOFY_*_HOST` / `TOFY_*_URI` come from the engine. Redis on Aws is ElastiCache with in-transit encryption, so `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS), not `redis://`. The bucket is IAM-less: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT`.
+
+At plan / apply / emit, tofy discovers the applying machine's public IPv4 and emits a tofy-owned security group in the account default VPC. Ingress is postgres / redis from that `/32` when bind is `Localhost`. RDS is `publicly_accessible` so the postgres host URI works from that machine. ElastiCache has no public IP: the same SG does not make Redis reachable from a laptop. If the public IP cannot be determined, the command errors; it does not open `0.0.0.0/0`. The `/32` is persisted in state so a later plan from a new IP is an SG-rule update. `Bind::All` is the documented wider ingress (`0.0.0.0/0`); the default example stays `Localhost`. No `.vpc()`, `.securityGroup()`, `.cidr()`, or `.publiclyAccessible()` on the builders.
