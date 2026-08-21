@@ -41,7 +41,7 @@ impl ResourceDecl for Redis<Open> {}
 impl ResourceDecl for Bucket<Open> {}
 
 /// Postgres resource declaration. Not a database client.
-/// `Postgres<Open>` has version/port/size/bind. There is no `.replicas()`.
+/// `Postgres<Open>` has version/port/size/bind/replicas.
 #[derive(Debug, Clone)]
 pub struct Postgres<S> {
     name: String,
@@ -49,6 +49,7 @@ pub struct Postgres<S> {
     port: Option<u16>,
     size: Size,
     bind: Bind,
+    replicas: u32,
     _state: PhantomData<S>,
 }
 
@@ -72,6 +73,11 @@ impl Postgres<Open> {
         self.bind = bind;
         self
     }
+
+    pub fn replicas(mut self, n: u32) -> Self {
+        self.replicas = n;
+        self
+    }
 }
 
 impl From<Postgres<Open>> for Resource {
@@ -83,13 +89,13 @@ impl From<Postgres<Open>> for Resource {
             port: p.port,
             size: p.size,
             bind: p.bind,
-            replicas: 1,
+            replicas: p.replicas,
         }
     }
 }
 
 /// Mysql resource declaration. Not a database client.
-/// `Mysql<Open>` has version/port/size/bind. There is no `.replicas()`.
+/// `Mysql<Open>` has version/port/size/bind/replicas.
 #[derive(Debug, Clone)]
 pub struct Mysql<S> {
     name: String,
@@ -97,6 +103,7 @@ pub struct Mysql<S> {
     port: Option<u16>,
     size: Size,
     bind: Bind,
+    replicas: u32,
     _state: PhantomData<S>,
 }
 
@@ -120,6 +127,11 @@ impl Mysql<Open> {
         self.bind = bind;
         self
     }
+
+    pub fn replicas(mut self, n: u32) -> Self {
+        self.replicas = n;
+        self
+    }
 }
 
 impl From<Mysql<Open>> for Resource {
@@ -131,13 +143,13 @@ impl From<Mysql<Open>> for Resource {
             port: p.port,
             size: p.size,
             bind: p.bind,
-            replicas: 1,
+            replicas: p.replicas,
         }
     }
 }
 
 /// Redis resource declaration. Not a live client.
-/// `Redis<Open>` has version/port/size/bind. There is no `.replicas()`.
+/// `Redis<Open>` has version/port/size/bind/replicas.
 #[derive(Debug, Clone)]
 pub struct Redis<S> {
     name: String,
@@ -145,6 +157,7 @@ pub struct Redis<S> {
     port: Option<u16>,
     size: Size,
     bind: Bind,
+    replicas: u32,
     _state: PhantomData<S>,
 }
 
@@ -168,6 +181,11 @@ impl Redis<Open> {
         self.bind = bind;
         self
     }
+
+    pub fn replicas(mut self, n: u32) -> Self {
+        self.replicas = n;
+        self
+    }
 }
 
 impl From<Redis<Open>> for Resource {
@@ -179,7 +197,7 @@ impl From<Redis<Open>> for Resource {
             port: r.port,
             size: r.size,
             bind: r.bind,
-            replicas: 1,
+            replicas: r.replicas,
         }
     }
 }
@@ -371,6 +389,7 @@ pub fn postgres(name: impl Into<String>) -> Postgres<Open> {
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
+        replicas: 1,
         _state: PhantomData,
     }
 }
@@ -382,6 +401,7 @@ pub fn mysql(name: impl Into<String>) -> Mysql<Open> {
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
+        replicas: 1,
         _state: PhantomData,
     }
 }
@@ -393,6 +413,7 @@ pub fn redis(name: impl Into<String>) -> Redis<Open> {
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
+        replicas: 1,
         _state: PhantomData,
     }
 }
@@ -453,6 +474,13 @@ mod tests {
         assert_eq!(project.resources[3].kind, Kind::Mysql);
         assert_eq!(project.resources[3].port, Some(3307));
         assert_eq!(project.resources[3].version.as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn replicas_on_engines() {
+        assert_eq!(Resource::from(postgres("appdb").replicas(2)).replicas, 2);
+        assert_eq!(Resource::from(mysql("appmysql").replicas(3)).replicas, 3);
+        assert_eq!(Resource::from(redis("cache").replicas(2)).replicas, 2);
     }
 
     #[test]

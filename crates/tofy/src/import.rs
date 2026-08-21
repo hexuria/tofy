@@ -142,9 +142,17 @@ fn from_tofu_value(value: &Value, project: Option<&str>, backend: Backend) -> Re
     let project_name = resolve_tofu_project(project, value)?;
     let mut spec = Project::new(project_name);
     spec.backend = backend;
+    let mut grouped: BTreeMap<String, Vec<(&String, &Value)>> = BTreeMap::new();
     for (key, container) in containers {
-        spec.resources
-            .push(container_to_resource(value, key, container)?);
+        let name = resource_name(container, key);
+        grouped.entry(name).or_default().push((key, container));
+    }
+    for (_name, mut members) in grouped {
+        members.sort_by_key(|(_, c)| replica_sort_key(c));
+        let (key, container) = members[0];
+        let mut r = container_to_resource(value, key, container)?;
+        r.replicas = u32::try_from(members.len()).unwrap_or(1);
+        spec.resources.push(r);
     }
     spec.validate()?;
     Ok(spec)
@@ -228,18 +236,45 @@ fn resource_name(container: &Value, key: &str) -> String {
 }
 
 fn docker_image_name<'a>(root: &'a Value, key: &str) -> Result<&'a str> {
-    root.get("resource")
+    let imgs = root
+        .get("resource")
         .and_then(|r| r.get("docker_image"))
-        .and_then(|imgs| imgs.get(key))
-        .and_then(|img| img.get("name"))
-        .and_then(|n| n.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            Error::Usage(format!(
-                "docker_container {key} has no docker_image.{key}.name"
-            ))
-        })
+        .and_then(|imgs| imgs.as_object());
+    let lookup = |k: &str| {
+        imgs.and_then(|imgs| imgs.get(k))
+            .and_then(|img| img.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(name) = lookup(key) {
+        return Ok(name);
+    }
+    if let Some((base, rest)) = key.rsplit_once('_') {
+        if rest.chars().all(|c| c.is_ascii_digit()) {
+            if let Some(name) = lookup(base) {
+                return Ok(name);
+            }
+        }
+    }
+    Err(Error::Usage(format!(
+        "docker_container {key} has no docker_image.{key}.name"
+    )))
+}
+
+fn replica_sort_key(container: &Value) -> u32 {
+    if let Some(n) = label_in(container, "tofy.replica").and_then(|s| s.parse().ok()) {
+        return n;
+    }
+    if container
+        .get("ports")
+        .and_then(|p| p.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        1
+    } else {
+        2
+    }
 }
 
 fn tofu_first_port(container: &Value) -> Result<Option<(Bind, u16)>> {
@@ -610,7 +645,7 @@ services:
     }
 
     #[test]
-    fn replicas_over_one_fail_validation() {
+    fn replicas_over_one_ok_on_local_and_tofu() {
         let yaml = r#"
 name: demo
 services:
@@ -619,8 +654,39 @@ services:
     deploy:
       replicas: 2
 "#;
+        let local = from_compose_str(yaml, None, Backend::Local, None).unwrap();
+        assert_eq!(local.resource("cache").unwrap().replicas, 2);
+        let tofu = from_compose_str(yaml, None, Backend::Tofu, None).unwrap();
+        assert_eq!(tofu.resource("cache").unwrap().replicas, 2);
+        assert_eq!(tofu.backend, Backend::Tofu);
+    }
+
+    #[test]
+    fn replicas_over_one_fail_on_aws() {
+        let yaml = r#"
+name: demo
+services:
+  cache:
+    image: redis:7
+    deploy:
+      replicas: 2
+"#;
+        let err = from_compose_str(yaml, None, Backend::Aws, None).unwrap_err();
+        assert!(err.to_string().contains("aws backend has no HA"), "{err}");
+    }
+
+    #[test]
+    fn bucket_replicas_over_one_fail_on_local() {
+        let yaml = r#"
+name: demo
+services:
+  uploads:
+    image: minio/minio:latest
+    deploy:
+      replicas: 2
+"#;
         let err = from_compose_str(yaml, None, Backend::Local, None).unwrap_err();
-        assert!(err.to_string().contains("local backend has no HA"), "{err}");
+        assert!(err.to_string().contains("bucket has no HA"), "{err}");
     }
 
     #[test]
@@ -791,6 +857,25 @@ services:
         assert!(!json.to_ascii_lowercase().contains("password"), "{json}");
         assert!(!json.contains("POSTGRES_"), "{json}");
         assert!(!json.contains("supersecret"), "{json}");
+    }
+
+    #[test]
+    fn tofu_json_round_trip_replicas() {
+        let mut spec = Project::new("demo");
+        spec.resources.push(
+            Resource::new("cache", Kind::Redis)
+                .with_port(6379)
+                .with_replicas(2),
+        );
+        let state = prepare_state(&spec, &State::default());
+        let raw = serde_json::to_string_pretty(&terraform_json(&spec, &state)).unwrap();
+        let imported = from_tofu_str(&raw, None, Backend::Local).unwrap();
+        assert_eq!(imported.resources.len(), 1);
+        let cache = imported.resource("cache").unwrap();
+        assert_eq!(cache.kind, Kind::Redis);
+        assert_eq!(cache.replicas, 2);
+        assert_eq!(cache.port, Some(6379));
+        assert!(!imported.to_json_pretty().unwrap().contains("password"));
     }
 
     #[test]

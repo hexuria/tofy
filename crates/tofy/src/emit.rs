@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use tofy_spec::{docker_network, replica_volume, Backend, Bind, Kind, Project};
+use tofy_spec::{docker_network, replica_alias, replica_container, replica_volume, Backend, Bind, Kind, Project};
 
 use crate::aws;
 use crate::error::Result;
@@ -22,55 +22,66 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
 
     for r in &spec.resources {
         let image = docker_image(r);
-        let key = sanitize(&r.name);
-        images.insert(key.clone(), json!({ "name": image, "keep_locally": true }));
+        let image_key = sanitize(&r.name);
+        images.insert(image_key.clone(), json!({ "name": image, "keep_locally": true }));
         let rs = state.resources.get(&r.name);
         let outs = rs.map(|s| s.outputs.clone()).unwrap_or_default();
         let host_port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
         let (env, cmd) = container_env(r.kind, &outs);
-        let mut c = json!({
-            "name": format!("tofy-{}-{}", spec.project, r.name),
-            "image": format!("${{docker_image.{key}.image_id}}"),
-            "hostname": r.name,
-            "restart": "unless-stopped",
-            "must_run": true,
-            "memory": r.size.docker_memory_mb(),
-            "memory_swap": r.size.docker_memory_swap_mb(),
-            "cpus": r.size.docker_cpus(),
-            "ports": [{
-                "internal": r.kind.internal_port(),
-                "external": host_port,
-                "ip": r.bind.as_ip(),
-            }],
-            "env": env,
-            "networks_advanced": [{
-                "name": "${docker_network.stack.name}",
-                "aliases": [r.name.clone()],
-            }],
-            "labels": [
-                { "label": "tofy.project", "value": spec.project },
-                { "label": "tofy.resource", "value": r.name },
-                { "label": "tofy.replica", "value": "1" },
-            ],
-        });
-        if let Some(cmd) = cmd {
-            c["command"] = json!(cmd);
-        }
-        if matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Bucket) {
-            let vol = replica_volume(&spec.project, &r.name, 0);
-            volumes.insert(key.clone(), json!({ "name": vol }));
-            let mount = match r.kind {
-                Kind::Postgres => "/var/lib/postgresql/data",
-                Kind::Mysql => "/var/lib/mysql",
-                Kind::Bucket => "/data",
-                Kind::Redis => unreachable!(),
+        let n = r.replicas_or_default();
+        for i in 0..n {
+            let key = if i == 0 {
+                image_key.clone()
+            } else {
+                sanitize(&replica_alias(&r.name, i))
             };
-            c["volumes"] = json!([{
-                "volume_name": format!("${{docker_volume.{key}.name}}"),
-                "container_path": mount,
-            }]);
+            let alias = replica_alias(&r.name, i);
+            let mut c = json!({
+                "name": replica_container(&spec.project, &r.name, i),
+                "image": format!("${{docker_image.{image_key}.image_id}}"),
+                "hostname": alias,
+                "restart": "unless-stopped",
+                "must_run": true,
+                "memory": r.size.docker_memory_mb(),
+                "memory_swap": r.size.docker_memory_swap_mb(),
+                "cpus": r.size.docker_cpus(),
+                "env": env.clone(),
+                "networks_advanced": [{
+                    "name": "${docker_network.stack.name}",
+                    "aliases": [alias.clone()],
+                }],
+                "labels": [
+                    { "label": "tofy.project", "value": spec.project },
+                    { "label": "tofy.resource", "value": r.name },
+                    { "label": "tofy.replica", "value": format!("{}", i + 1) },
+                ],
+            });
+            if i == 0 {
+                c["ports"] = json!([{
+                    "internal": r.kind.internal_port(),
+                    "external": host_port,
+                    "ip": r.bind.as_ip(),
+                }]);
+            }
+            if let Some(cmd) = cmd.clone() {
+                c["command"] = json!(cmd);
+            }
+            if matches!(r.kind, Kind::Postgres | Kind::Mysql | Kind::Bucket) {
+                let vol = replica_volume(&spec.project, &r.name, i);
+                volumes.insert(key.clone(), json!({ "name": vol }));
+                let mount = match r.kind {
+                    Kind::Postgres => "/var/lib/postgresql/data",
+                    Kind::Mysql => "/var/lib/mysql",
+                    Kind::Bucket => "/data",
+                    Kind::Redis => unreachable!(),
+                };
+                c["volumes"] = json!([{
+                    "volume_name": format!("${{docker_volume.{key}.name}}"),
+                    "container_path": mount,
+                }]);
+            }
+            containers.insert(key, c);
         }
-        containers.insert(key, c);
     }
 
     let mut resource = serde_json::Map::new();
@@ -1064,5 +1075,56 @@ mod tests {
             APPLIER
         );
         assert!(atf["resource"].get("aws_vpc").is_none());
+    }
+
+    #[test]
+    fn tofu_emits_n_containers_host_port_only_on_replica_zero() {
+        let mut spec = Project::new("demo");
+        spec.resources.push(
+            Resource::new("cache", Kind::Redis)
+                .with_port(6379)
+                .with_replicas(2),
+        );
+        let state = prepare_state(&spec, &State::default());
+        let tf = terraform_json(&spec, &state);
+        let containers = tf["resource"]["docker_container"].as_object().unwrap();
+        assert!(containers.contains_key("cache"), "{containers:?}");
+        assert!(containers.contains_key("cache_2"), "{containers:?}");
+        assert_eq!(containers["cache"]["name"], "tofy-demo-cache");
+        assert_eq!(containers["cache_2"]["name"], "tofy-demo-cache-2");
+        assert_eq!(containers["cache"]["ports"][0]["external"], 6379);
+        assert!(
+            containers["cache_2"].get("ports").is_none(),
+            "only replica 0 is published: {}",
+            containers["cache_2"]
+        );
+        assert_eq!(
+            containers["cache"]["networks_advanced"][0]["aliases"][0],
+            "cache"
+        );
+        assert_eq!(
+            containers["cache_2"]["networks_advanced"][0]["aliases"][0],
+            "cache-2"
+        );
+        assert_eq!(containers["cache"]["hostname"], "cache");
+        assert_eq!(containers["cache_2"]["hostname"], "cache-2");
+        let labels0 = &containers["cache"]["labels"];
+        let labels1 = &containers["cache_2"]["labels"];
+        assert_eq!(labels0[2]["label"], "tofy.replica");
+        assert_eq!(labels0[2]["value"], "1");
+        assert_eq!(labels1[2]["value"], "2");
+        assert_eq!(labels1[1]["value"], "cache");
+        assert!(
+            tf["resource"]["docker_image"]
+                .as_object()
+                .unwrap()
+                .contains_key("cache")
+        );
+        assert!(
+            !tf["resource"]["docker_image"]
+                .as_object()
+                .unwrap()
+                .contains_key("cache_2")
+        );
     }
 }

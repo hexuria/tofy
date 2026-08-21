@@ -93,3 +93,4 @@ No AWS, no new kinds, no PgPool.
 - Importers into the same IR (not a write path; not auto-loaded) — **Compose subset shipped:** `tofy import compose` emits JSON IR. `--spec` remains JSON-only. Unknown images fail.
 - More app-adjacent kinds — **`mysql` shipped** (builders / Docker / Tofu docker / AWS RDS). Default examples stay postgres+redis+bucket so existing smokes are unchanged.
 - Optional live `PgPool` after apply for Rust apps that want it. Do not default to Shuttle. The consume path for other languages stays env — **shipped as `crates/tofy-pg`**. Env remains the default. `Stack<Applied>::uri` returns the host URI string without opening a client.
+- Replicas HA on local + Tofu docker (`postgres` / `mysql` / `redis`). Aws and `bucket` still reject `replicas > 1`. Host URI is replica 0; extra replicas are in-stack only.

@@ -334,10 +334,17 @@ impl Project {
                 )));
             }
             if r.replicas > 1 {
-                return Err(SpecError::Validation(format!(
-                    "local backend has no HA: {} replicas must be 1",
-                    r.kind
-                )));
+                if r.kind == Kind::Bucket {
+                    return Err(SpecError::Validation(
+                        "bucket has no HA: replicas must be 1".into(),
+                    ));
+                }
+                if self.backend == Backend::Aws {
+                    return Err(SpecError::Validation(format!(
+                        "aws backend has no HA: {} replicas must be 1",
+                        r.kind
+                    )));
+                }
             }
         }
         Ok(())
@@ -412,6 +419,15 @@ pub fn replica_container(project: &str, resource: &str, index: u32) -> String {
         container_name(project, resource)
     } else {
         format!("{}-{}", container_name(project, resource), index + 1)
+    }
+}
+
+/// In-stack DNS alias: the resource name for replica 0; `name-2`, `name-3`, … after that.
+pub fn replica_alias(resource: &str, index: u32) -> String {
+    if index == 0 {
+        resource.to_string()
+    } else {
+        format!("{}-{}", resource, index + 1)
     }
 }
 
@@ -546,17 +562,54 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_rejects_replicas() {
+    fn docker_backends_allow_engine_replicas() {
+        for backend in ["local", "tofu"] {
+            for typ in ["postgres", "mysql", "redis"] {
+                let spec = Project::from_json_str(&format!(
+                    r#"{{"project":"demo","backend":"{backend}","resources":[{{"name":"x","type":"{typ}","replicas":2}}]}}"#
+                ))
+                .unwrap();
+                assert_eq!(spec.resources[0].replicas, 2, "{backend} {typ}");
+            }
+        }
+    }
+
+    #[test]
+    fn aws_backend_rejects_replicas() {
         for typ in ["postgres", "mysql", "redis", "bucket"] {
             let err = Project::from_json_str(&format!(
-                r#"{{"project":"demo","resources":[{{"name":"x","type":"{typ}","replicas":2}}]}}"#
+                r#"{{"project":"demo","backend":"aws","resources":[{{"name":"x","type":"{typ}","replicas":2}}]}}"#
+            ))
+            .unwrap_err();
+            let msg = err.to_string();
+            if typ == "bucket" {
+                assert!(msg.contains("bucket has no HA"), "{typ}: {msg}");
+            } else {
+                assert!(msg.contains("aws backend has no HA"), "{typ}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_rejects_replicas_on_docker_backends() {
+        for backend in ["local", "tofu"] {
+            let err = Project::from_json_str(&format!(
+                r#"{{"project":"demo","backend":"{backend}","resources":[{{"name":"x","type":"bucket","replicas":2}}]}}"#
             ))
             .unwrap_err();
             assert!(
-                err.to_string().contains("local backend has no HA"),
-                "{typ}: {err}"
+                err.to_string().contains("bucket has no HA"),
+                "{backend}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn replica_alias_and_container_names() {
+        assert_eq!(replica_alias("appdb", 0), "appdb");
+        assert_eq!(replica_alias("appdb", 1), "appdb-2");
+        assert_eq!(replica_container("demo", "appdb", 0), "tofy-demo-appdb");
+        assert_eq!(replica_container("demo", "appdb", 1), "tofy-demo-appdb-2");
     }
 
     #[test]
