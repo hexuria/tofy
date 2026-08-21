@@ -1,15 +1,19 @@
-//! Constrained Docker Compose subset → JSON IR.
+//! Constrained Docker Compose subset and docker-provider OpenTofu JSON → JSON IR.
 //!
 //! This is an importer, not a yaml write path and not auto-load. Unknown
-//! images fail. Secrets in Compose env are not copied into the spec.
+//! images fail. Secrets in Compose env / tofu env are not copied into the spec.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
+use serde_json::Value;
 use tofy_spec::{Backend, Bind, Kind, Project, Resource, Size};
 
 use crate::error::{Error, Result};
+
+const IMAGE_ALIASES: &str =
+    "postgres, postgresql, mysql, mariadb, redis, minio/minio, bitnami/postgres, bitnami/postgresql, bitnami/mysql, bitnami/mariadb, and bitnami/redis";
 
 #[derive(Debug, Deserialize)]
 struct ComposeFile {
@@ -17,6 +21,12 @@ struct ComposeFile {
     name: Option<String>,
     #[serde(default)]
     services: BTreeMap<String, ComposeService>,
+    /// Named extra networks. Warned and ignored; not a failure.
+    #[serde(default)]
+    networks: Option<serde_yaml::Value>,
+    /// Named extra volumes. Warned and ignored; not a failure.
+    #[serde(default)]
+    volumes: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -29,6 +39,12 @@ struct ComposeService {
     mem_limit: Option<serde_yaml::Value>,
     #[serde(default)]
     deploy: Option<ComposeDeploy>,
+    /// Warned and ignored; not a failure.
+    #[serde(default)]
+    depends_on: Option<serde_yaml::Value>,
+    /// Service networks besides the ones we already ignore. Warned; not a failure.
+    #[serde(default)]
+    networks: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -64,6 +80,12 @@ pub fn from_compose_str(
 ) -> Result<Project> {
     let file: ComposeFile = serde_yaml::from_str(yaml)
         .map_err(|e| Error::Usage(format!("invalid compose yaml: {e}")))?;
+    if file.networks.is_some() {
+        eprintln!("warning: compose top-level networks: ignored");
+    }
+    if file.volumes.is_some() {
+        eprintln!("warning: compose top-level volumes: ignored");
+    }
     if file.services.is_empty() {
         return Err(Error::Usage("compose has no services".into()));
     }
@@ -71,10 +93,221 @@ pub fn from_compose_str(
     let mut spec = Project::new(project_name);
     spec.backend = backend;
     for (name, svc) in file.services {
+        if svc.depends_on.is_some() {
+            eprintln!("warning: compose service {name} depends_on ignored");
+        }
+        if svc.networks.is_some() {
+            eprintln!("warning: compose service {name} networks ignored");
+        }
         spec.resources.push(service_to_resource(&name, &svc)?);
     }
     spec.validate()?;
     Ok(spec)
+}
+
+/// Parse docker-provider OpenTofu JSON (`main.tf.json`) into a validated [`Project`].
+/// Does not run tofu and does not apply. AWS-provider JSON is rejected.
+pub fn from_tofu_file(path: &Path, project: Option<&str>, backend: Backend) -> Result<Project> {
+    let raw = std::fs::read_to_string(path)?;
+    from_tofu_str(&raw, project, backend)
+}
+
+/// Parse docker-provider OpenTofu JSON text into a validated [`Project`].
+pub fn from_tofu_str(json: &str, project: Option<&str>, backend: Backend) -> Result<Project> {
+    let value: Value = serde_json::from_str(json)?;
+    from_tofu_value(&value, project, backend)
+}
+
+fn from_tofu_value(value: &Value, project: Option<&str>, backend: Backend) -> Result<Project> {
+    if is_aws_opentofu(value) {
+        return Err(Error::Usage(
+            "AWS OpenTofu JSON cannot be imported; importer maps docker-provider JSON only".into(),
+        ));
+    }
+    let containers = value
+        .get("resource")
+        .and_then(|r| r.get("docker_container"))
+        .and_then(|c| c.as_object())
+        .ok_or_else(|| {
+            Error::Usage(
+                "no docker_container resource; importer maps docker-provider OpenTofu JSON only"
+                    .into(),
+            )
+        })?;
+    if containers.is_empty() {
+        return Err(Error::Usage(
+            "no docker_container resource; importer maps docker-provider OpenTofu JSON only".into(),
+        ));
+    }
+    let project_name = resolve_tofu_project(project, value)?;
+    let mut spec = Project::new(project_name);
+    spec.backend = backend;
+    for (key, container) in containers {
+        spec.resources
+            .push(container_to_resource(value, key, container)?);
+    }
+    spec.validate()?;
+    Ok(spec)
+}
+
+fn is_aws_opentofu(value: &Value) -> bool {
+    let has_aws_provider = value
+        .get("terraform")
+        .and_then(|t| t.get("required_providers"))
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| p.contains_key("aws"));
+    if has_aws_provider {
+        return true;
+    }
+    value
+        .get("resource")
+        .and_then(|r| r.as_object())
+        .is_some_and(|r| r.keys().any(|k| k.starts_with("aws_")))
+}
+
+fn resolve_tofu_project(explicit: Option<&str>, value: &Value) -> Result<String> {
+    if let Some(p) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(p.to_string());
+    }
+    let stack = value
+        .get("resource")
+        .and_then(|r| r.get("docker_network"))
+        .and_then(|n| n.get("stack"));
+    if let Some(stack) = stack {
+        if let Some(p) = label_in(stack, "tofy.project")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(p);
+        }
+        if let Some(name) = stack.get("name").and_then(|v| v.as_str()) {
+            let stripped = name
+                .strip_prefix("tofy-")
+                .unwrap_or(name)
+                .trim()
+                .to_string();
+            if !stripped.is_empty() {
+                return Ok(stripped);
+            }
+        }
+    }
+    Err(Error::Usage(
+        "tofu import needs --project or docker_network.stack".into(),
+    ))
+}
+
+fn container_to_resource(root: &Value, key: &str, container: &Value) -> Result<Resource> {
+    let name = resource_name(container, key);
+    let image = docker_image_name(root, key)?;
+    let (kind, tag) = kind_from_image(image)?;
+    let mut r = Resource::new(name, kind);
+    if let Some(tag) = tag {
+        r.version = Some(tag);
+    }
+    if let Some((bind, port)) = tofu_first_port(container)? {
+        r.bind = bind;
+        r.port = Some(port);
+    }
+    r.size = size_from_memory_mb(container.get("memory"));
+    Ok(r)
+}
+
+fn resource_name(container: &Value, key: &str) -> String {
+    if let Some(name) = label_in(container, "tofy.resource").filter(|s| !s.is_empty()) {
+        return name;
+    }
+    if let Some(host) = container
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return host.to_string();
+    }
+    key.to_string()
+}
+
+fn docker_image_name<'a>(root: &'a Value, key: &str) -> Result<&'a str> {
+    root.get("resource")
+        .and_then(|r| r.get("docker_image"))
+        .and_then(|imgs| imgs.get(key))
+        .and_then(|img| img.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "docker_container {key} has no docker_image.{key}.name"
+            ))
+        })
+}
+
+fn tofu_first_port(container: &Value) -> Result<Option<(Bind, u16)>> {
+    let Some(port0) = container
+        .get("ports")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+    else {
+        return Ok(None);
+    };
+    let Some(external) = port0.get("external") else {
+        return Ok(None);
+    };
+    let port = json_u16(external)?;
+    let ip = port0.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(Some((bind_from_ip(ip), port)))
+}
+
+fn json_u16(v: &Value) -> Result<u16> {
+    match v {
+        Value::Number(n) => n
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| Error::Usage(format!("unsupported port {v}"))),
+        Value::String(s) => s
+            .parse()
+            .map_err(|_| Error::Usage(format!("unsupported port {s:?}"))),
+        _ => Err(Error::Usage(format!("unsupported port {v}"))),
+    }
+}
+
+fn size_from_memory_mb(v: Option<&Value>) -> Size {
+    let Some(n) = v.and_then(json_u64) else {
+        return Size::Small;
+    };
+    match n {
+        256 => Size::Small,
+        512 => Size::Medium,
+        1024 => Size::Large,
+        _ => Size::Small,
+    }
+}
+
+fn json_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn label_in(obj: &Value, key: &str) -> Option<String> {
+    let labels = obj.get("labels")?;
+    let arr = labels.as_array()?;
+    for item in arr {
+        let Some(label) = item.get("label").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if label == key {
+            return item
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 fn resolve_project(
@@ -138,7 +371,7 @@ pub fn kind_from_image(image: &str) -> Result<(Kind, Option<String>)> {
     let (name, tag) = split_name_tag(image);
     let kind = kind_from_name(name).ok_or_else(|| {
         Error::Usage(format!(
-            "unknown compose image {image:?}; importer maps postgres, redis, mysql, and minio/minio only"
+            "unknown compose image {image:?}; importer maps {IMAGE_ALIASES} only"
         ))
     })?;
     Ok((kind, tag.map(|s| s.to_string())))
@@ -160,10 +393,11 @@ fn kind_from_name(name: &str) -> Option<Kind> {
     if name == "minio/minio" || name.ends_with("/minio/minio") {
         return Some(Kind::Bucket);
     }
+    // Last path segment: official postgres/mysql/redis/mariadb, bitnami/*, and */mariadb.
     let base = name.rsplit('/').next().unwrap_or(name);
     match base {
-        "postgres" => Some(Kind::Postgres),
-        "mysql" => Some(Kind::Mysql),
+        "postgres" | "postgresql" => Some(Kind::Postgres),
+        "mysql" | "mariadb" => Some(Kind::Mysql),
         "redis" => Some(Kind::Redis),
         _ => None,
     }
@@ -265,6 +499,8 @@ pub fn write_spec_json(spec: &Project, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::terraform_json;
+    use crate::state::{prepare_state, State};
 
     const DEMO: &str = r#"
 name: demo
@@ -320,6 +556,8 @@ services:
         let msg = err.to_string();
         assert!(msg.contains("nginx"), "{msg}");
         assert!(msg.contains("unknown compose image"), "{msg}");
+        assert!(msg.contains("mariadb"), "{msg}");
+        assert!(msg.contains("bitnami/redis"), "{msg}");
     }
 
     #[test]
@@ -430,5 +668,158 @@ services:
         assert_eq!(r.kind, Kind::Mysql);
         assert_eq!(r.port, Some(3307));
         assert_eq!(r.bind, Bind::Localhost);
+    }
+
+    #[test]
+    fn bitnami_and_mariadb_images_map() {
+        let (kind, tag) = kind_from_image("bitnami/redis:7.2").unwrap();
+        assert_eq!(kind, Kind::Redis);
+        assert_eq!(tag.as_deref(), Some("7.2"));
+        let (kind, tag) = kind_from_image("bitnami/postgresql:16").unwrap();
+        assert_eq!(kind, Kind::Postgres);
+        assert_eq!(tag.as_deref(), Some("16"));
+        let (kind, _) = kind_from_image("bitnami/postgres:16").unwrap();
+        assert_eq!(kind, Kind::Postgres);
+        let (kind, tag) = kind_from_image("mariadb:11").unwrap();
+        assert_eq!(kind, Kind::Mysql);
+        assert_eq!(tag.as_deref(), Some("11"));
+        let (kind, _) = kind_from_image("bitnami/mysql:8.0").unwrap();
+        assert_eq!(kind, Kind::Mysql);
+        let (kind, _) = kind_from_image("bitnami/mariadb:11").unwrap();
+        assert_eq!(kind, Kind::Mysql);
+        let (kind, _) = kind_from_image("docker.io/library/mariadb:11").unwrap();
+        assert_eq!(kind, Kind::Mysql);
+        let (kind, _) = kind_from_image("myorg/mariadb:11").unwrap();
+        assert_eq!(kind, Kind::Mysql);
+
+        let yaml = r#"
+name: demo
+services:
+  cache:
+    image: bitnami/redis:7.2
+  appdb:
+    image: bitnami/postgresql:16
+  appmysql:
+    image: mariadb:11
+"#;
+        let spec = from_compose_str(yaml, None, Backend::Local, None).unwrap();
+        assert_eq!(spec.resource("cache").unwrap().kind, Kind::Redis);
+        assert_eq!(spec.resource("appdb").unwrap().kind, Kind::Postgres);
+        assert_eq!(spec.resource("appmysql").unwrap().kind, Kind::Mysql);
+    }
+
+    #[test]
+    fn depends_on_and_extra_networks_volumes_succeed_without_passwords() {
+        let yaml = r#"
+name: demo
+networks:
+  extra: {}
+volumes:
+  data: {}
+services:
+  cache:
+    image: redis:7
+    depends_on:
+      - appdb
+    networks:
+      extra: {}
+    environment:
+      REDIS_PASSWORD: supersecret
+    ports:
+      - "127.0.0.1:6379:6379"
+  appdb:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: supersecret
+    ports:
+      - "127.0.0.1:5433:5432"
+"#;
+        let spec = from_compose_str(yaml, None, Backend::Local, None).unwrap();
+        assert_eq!(spec.resources.len(), 2);
+        assert_eq!(spec.resource("cache").unwrap().kind, Kind::Redis);
+        assert_eq!(spec.resource("appdb").unwrap().kind, Kind::Postgres);
+        let json = spec.to_json_pretty().unwrap();
+        assert!(!json.to_ascii_lowercase().contains("password"), "{json}");
+        assert!(!json.contains("supersecret"), "{json}");
+        assert!(!json.contains("POSTGRES_"), "{json}");
+    }
+
+    #[test]
+    fn tofu_json_round_trip() {
+        let mut spec = Project::new("demo");
+        spec.resources.push(
+            Resource::new("appdb", Kind::Postgres)
+                .with_port(5433)
+                .with_size(Size::Medium),
+        );
+        spec.resources.push(
+            Resource::new("cache", Kind::Redis)
+                .with_port(6379)
+                .with_bind(Bind::All),
+        );
+        spec.resources
+            .push(Resource::new("uploads", Kind::Bucket).with_port(9000));
+        let state = prepare_state(&spec, &State::default());
+        let tf = terraform_json(&spec, &state);
+        let raw = serde_json::to_string_pretty(&tf).unwrap();
+        assert!(
+            raw.contains("POSTGRES_PASSWORD") || raw.to_ascii_lowercase().contains("password"),
+            "emitted tofu JSON should contain secrets so import is proven to drop them"
+        );
+        assert!(
+            raw.contains("${docker_image.appdb.image_id}"),
+            "must look up docker_image.name, not the interpolation"
+        );
+
+        let imported = from_tofu_str(&raw, None, Backend::Local).unwrap();
+        assert_eq!(imported.project, "demo");
+        assert_eq!(imported.backend, Backend::Local);
+        assert_eq!(imported.resources.len(), 3);
+        let appdb = imported.resource("appdb").unwrap();
+        assert_eq!(appdb.kind, Kind::Postgres);
+        assert_eq!(appdb.port, Some(5433));
+        assert_eq!(appdb.bind, Bind::Localhost);
+        assert_eq!(appdb.size, Size::Medium);
+        let cache = imported.resource("cache").unwrap();
+        assert_eq!(cache.kind, Kind::Redis);
+        assert_eq!(cache.port, Some(6379));
+        assert_eq!(cache.bind, Bind::All);
+        let uploads = imported.resource("uploads").unwrap();
+        assert_eq!(uploads.kind, Kind::Bucket);
+        assert_eq!(uploads.port, Some(9000));
+        let json = imported.to_json_pretty().unwrap();
+        assert!(!json.to_ascii_lowercase().contains("password"), "{json}");
+        assert!(!json.contains("POSTGRES_"), "{json}");
+        assert!(!json.contains("supersecret"), "{json}");
+    }
+
+    #[test]
+    fn tofu_aws_shaped_json_errors() {
+        let providers = r#"{
+            "terraform": { "required_providers": { "aws": { "source": "hashicorp/aws" } } },
+            "resource": { "docker_container": { "appdb": { "hostname": "appdb" } } }
+        }"#;
+        let err = from_tofu_str(providers, Some("demo"), Backend::Aws).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("AWS"), "{msg}");
+        assert!(msg.contains("docker-provider"), "{msg}");
+
+        let rds = r#"{
+            "resource": { "aws_db_instance": { "appdb": { "engine": "postgres" } } }
+        }"#;
+        let err = from_tofu_str(rds, Some("demo"), Backend::Local).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("AWS"), "{msg}");
+        assert!(msg.contains("docker-provider"), "{msg}");
+    }
+
+    #[test]
+    fn tofu_missing_docker_container_errors() {
+        let json = r#"{
+            "terraform": { "required_providers": { "docker": { "source": "kreuzwerker/docker" } } },
+            "resource": { "docker_network": { "stack": { "name": "tofy-demo" } } }
+        }"#;
+        let err = from_tofu_str(json, Some("demo"), Backend::Local).unwrap_err();
+        assert!(err.to_string().contains("docker_container"), "{err}");
     }
 }
