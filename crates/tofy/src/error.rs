@@ -28,6 +28,8 @@ pub enum Error {
         "AWS credentials were not found in the environment; did not destroy. State left unchanged."
     )]
     DestroyNeedsAwsCredentials,
+    #[error("could not determine this machine's public IPv4 address; refusing to open 0.0.0.0/0")]
+    PublicIpv4Undetermined,
     #[error(
         "another tofy apply or destroy is already running in this directory; did not apply or destroy"
     )]

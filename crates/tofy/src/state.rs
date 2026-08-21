@@ -41,6 +41,10 @@ pub struct State {
     #[serde(default)]
     pub backend: Backend,
     pub resources: BTreeMap<String, ResourceState>,
+    /// Applying machine's public IPv4 as `a.b.c.d/32`. Used for the AWS
+    /// security group. Not a secret. Absent on Local / Tofu and on S3-only stacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applier_cidr: Option<String>,
 }
 
 impl State {
@@ -70,6 +74,7 @@ impl State {
 
     pub fn clear_resources(&mut self) {
         self.resources.clear();
+        self.applier_cidr = None;
     }
 
     /// Rebuild a [`Project`] from persisted resource state (destroy / re-emit).
@@ -158,6 +163,11 @@ pub fn prepare_state(spec: &Project, current: &State) -> State {
         project: spec.project.clone(),
         backend: spec.backend,
         resources,
+        applier_cidr: if spec.backend == Backend::Aws {
+            current.applier_cidr.clone()
+        } else {
+            None
+        },
     }
 }
 
@@ -176,7 +186,9 @@ pub fn outputs_for(
     out.insert("replicas".into(), r.replicas_or_default().to_string());
     match spec.backend {
         Backend::Aws => aws_outputs_for(spec, r, have, &mut out),
-        Backend::Local | Backend::Tofu => local_outputs_for(r, have, port, internal_port, in_host, &mut out),
+        Backend::Local | Backend::Tofu => {
+            local_outputs_for(r, have, port, internal_port, in_host, &mut out)
+        }
     }
     out
 }
@@ -276,10 +288,7 @@ fn aws_outputs_for(
             let password = existing_output(have, "password").unwrap_or_else(|| generate_secret(32));
             let host = existing_output(have, "host").unwrap_or_default();
             if !host.is_empty() {
-                out.insert(
-                    "uri".into(),
-                    format!("redis://:{password}@{host}:{port}"),
-                );
+                out.insert("uri".into(), format!("redis://:{password}@{host}:{port}"));
                 out.insert("host".into(), host);
             }
             out.insert("password".into(), password);
@@ -412,7 +421,8 @@ mod tests {
     fn aws_outputs_are_iam_less_bucket_and_generated_secrets() {
         let mut spec = Project::new("demoaws");
         spec.backend = Backend::Aws;
-        spec.resources.push(Resource::new("appdb", Kind::Postgres).with_port(25432));
+        spec.resources
+            .push(Resource::new("appdb", Kind::Postgres).with_port(25432));
         spec.resources.push(Resource::new("cache", Kind::Redis));
         spec.resources.push(Resource::new("uploads", Kind::Bucket));
         let first = prepare_state(&spec, &State::default());
@@ -426,7 +436,10 @@ mod tests {
         assert_eq!(cache["password"].len(), 32);
         assert!(!cache.contains_key("uri"));
         let files = &first.resources["uploads"].outputs;
-        assert!(files["bucket"].starts_with("tofy-demoaws-uploads-"), "{files:?}");
+        assert!(
+            files["bucket"].starts_with("tofy-demoaws-uploads-"),
+            "{files:?}"
+        );
         assert!(!files.contains_key("access_key"), "{files:?}");
         assert!(!files.contains_key("secret_key"), "{files:?}");
         let second = prepare_state(&spec, &first);
@@ -438,6 +451,11 @@ mod tests {
             first.resources["uploads"].outputs["bucket"],
             second.resources["uploads"].outputs["bucket"]
         );
+        assert!(first.applier_cidr.is_none());
+        let mut with_cidr = first.clone();
+        with_cidr.applier_cidr = Some("203.0.113.10/32".into());
+        let third = prepare_state(&spec, &with_cidr);
+        assert_eq!(third.applier_cidr.as_deref(), Some("203.0.113.10/32"));
     }
 
     #[test]

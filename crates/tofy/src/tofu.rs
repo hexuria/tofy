@@ -23,7 +23,8 @@ pub fn available() -> bool {
 }
 
 pub fn apply(root: &Path, spec: &Project, state: &State) -> Result<()> {
-    emit::write_tofu_config(root, spec, state)?;
+    let mut emit_state = state.clone();
+    emit::write_tofu_config(root, spec, &mut emit_state)?;
     let secrets = secret_values(state);
     run(root, &["init", "-input=false", "-no-color"], &secrets)?;
     run(
@@ -37,7 +38,8 @@ pub fn apply(root: &Path, spec: &Project, state: &State) -> Result<()> {
 /// Emit `.tofy/main.tf.json` (0600), `tofu init` if needed, and return `tofu plan`.
 /// Does not persist Applied status. Missing tofu is an error, not "No changes."
 pub fn plan(root: &Path, spec: &Project, state: &State) -> Result<String> {
-    emit::write_tofu_config(root, spec, state)?;
+    let mut emit_state = state.clone();
+    emit::write_tofu_config(root, spec, &mut emit_state)?;
     if !available() {
         return Err(Error::PlanNeedsTofu);
     }
@@ -48,7 +50,8 @@ pub fn plan(root: &Path, spec: &Project, state: &State) -> Result<String> {
 
 pub fn destroy(root: &Path, state: &State) -> Result<()> {
     let spec = state.as_project();
-    emit::write_tofu_config(root, &spec, state)?;
+    let mut emit_state = state.clone();
+    emit::write_tofu_config(root, &spec, &mut emit_state)?;
     let secrets = secret_values(state);
     run(root, &["init", "-input=false", "-no-color"], &secrets)?;
     run(
