@@ -1,23 +1,57 @@
-use std::cell::RefCell;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::path::PathBuf;
 
 use tofy_spec::{Bind, Kind, Project, Resource, Size};
 
 thread_local! {
-    static DECLARED: RefCell<Option<Project>> = const { RefCell::new(None) };
+    static OPEN_STACK: Cell<bool> = const { Cell::new(false) };
 }
 
+fn mark_stack_open() {
+    OPEN_STACK.with(|c| c.set(true));
+}
+
+fn mark_stack_closed() {
+    OPEN_STACK.with(|c| c.set(false));
+}
+
+pub(crate) fn stack_left_open() -> bool {
+    OPEN_STACK.with(|c| c.get())
+}
+
+/// Resource declaration is open for setters. Adding to a stack consumes it.
+pub enum Open {}
+
+/// `stack(name)` before any resource is added. No plan/apply/output/run.
+pub enum Empty {}
+
+/// Stack has at least one resource. `add`, `plan`, `apply` only.
+pub enum NonEmpty {}
+
+/// Engine has run. `output` / `run` only — no `add`, no second `apply`.
+pub enum Applied {}
+
+/// Kind-specific declarations that can be moved into a stack.
+pub trait ResourceDecl: Into<Resource> {}
+
+impl ResourceDecl for Postgres<Open> {}
+impl ResourceDecl for Redis<Open> {}
+impl ResourceDecl for Bucket<Open> {}
+
 /// Postgres resource declaration. Not a database client.
-/// Local postgres has no HA; there is no `.replicas()` on this type.
+/// `Postgres<Open>` has version/port/size/bind. There is no `.replicas()`.
 #[derive(Debug, Clone)]
-pub struct Postgres {
+pub struct Postgres<S> {
     name: String,
     version: Option<String>,
     port: Option<u16>,
     size: Size,
     bind: Bind,
+    _state: PhantomData<S>,
 }
 
-impl Postgres {
+impl Postgres<Open> {
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
@@ -39,8 +73,8 @@ impl Postgres {
     }
 }
 
-impl From<Postgres> for Resource {
-    fn from(p: Postgres) -> Self {
+impl From<Postgres<Open>> for Resource {
+    fn from(p: Postgres<Open>) -> Self {
         Resource {
             name: p.name,
             kind: Kind::Postgres,
@@ -55,16 +89,17 @@ impl From<Postgres> for Resource {
 
 /// Redis resource declaration. Not a live client.
 #[derive(Debug, Clone)]
-pub struct Redis {
+pub struct Redis<S> {
     name: String,
     version: Option<String>,
     port: Option<u16>,
     size: Size,
     bind: Bind,
     replicas: u32,
+    _state: PhantomData<S>,
 }
 
-impl Redis {
+impl Redis<Open> {
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
@@ -91,8 +126,8 @@ impl Redis {
     }
 }
 
-impl From<Redis> for Resource {
-    fn from(r: Redis) -> Self {
+impl From<Redis<Open>> for Resource {
+    fn from(r: Redis<Open>) -> Self {
         Resource {
             name: r.name,
             kind: Kind::Redis,
@@ -107,16 +142,17 @@ impl From<Redis> for Resource {
 
 /// Object-storage bucket declaration. Not an SDK client.
 #[derive(Debug, Clone)]
-pub struct Bucket {
+pub struct Bucket<S> {
     name: String,
     version: Option<String>,
     port: Option<u16>,
     size: Size,
     bind: Bind,
     replicas: u32,
+    _state: PhantomData<S>,
 }
 
-impl Bucket {
+impl Bucket<Open> {
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
@@ -143,8 +179,8 @@ impl Bucket {
     }
 }
 
-impl From<Bucket> for Resource {
-    fn from(b: Bucket) -> Self {
+impl From<Bucket<Open>> for Resource {
+    fn from(b: Bucket<Open>) -> Self {
         Resource {
             name: b.name,
             kind: Kind::Bucket,
@@ -157,30 +193,115 @@ impl From<Bucket> for Resource {
     }
 }
 
-pub struct Stack;
+pub struct Stack<S> {
+    project: Project,
+    _state: PhantomData<S>,
+}
 
-impl Stack {
-    pub fn add(self, resource: impl Into<Resource>) -> Self {
-        DECLARED.with(|slot| {
-            if let Some(project) = slot.borrow_mut().as_mut() {
-                project.resources.push(resource.into());
-            }
-        });
-        self
+impl Stack<Empty> {
+    pub fn add(mut self, resource: impl ResourceDecl) -> Stack<NonEmpty> {
+        self.project.resources.push(resource.into());
+        Stack {
+            project: self.project,
+            _state: PhantomData,
+        }
     }
 }
 
-pub fn postgres(name: impl Into<String>) -> Postgres {
+impl Stack<NonEmpty> {
+    pub fn add(mut self, resource: impl ResourceDecl) -> Stack<NonEmpty> {
+        self.project.resources.push(resource.into());
+        self
+    }
+
+    /// Print the plan against `.tofy/state.json`. Consumes the stack.
+    pub fn plan(self) {
+        mark_stack_closed();
+        let root = workdir();
+        match crate::engine::plan_text(&root, &self.project) {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("tofy: {e}");
+                std::process::exit(e.exit_code());
+            }
+        }
+    }
+
+    /// Hand the stack to the engine. `cargo run` applies; `cargo run -- plan`
+    /// and the other verbs still work. Seals the graph as [`Applied`].
+    pub fn apply(self) -> Stack<Applied> {
+        mark_stack_closed();
+        if let Err(e) = crate::cli::run_with_project(self.project.clone()) {
+            eprintln!("tofy: {e}");
+            std::process::exit(e.exit_code());
+        }
+        Stack {
+            project: self.project,
+            _state: PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_project(self) -> Project {
+        mark_stack_closed();
+        self.project
+    }
+}
+
+impl Stack<Applied> {
+    /// Print non-secret outputs (`tofy output`).
+    pub fn output(self) {
+        let root = workdir();
+        match crate::outputs::load(&root) {
+            Ok(map) => print!("{}", crate::outputs::format_public(&map)),
+            Err(e) => {
+                eprintln!("tofy: {e}");
+                std::process::exit(e.exit_code());
+            }
+        }
+    }
+
+    /// Inject outputs and exec. Equivalent to `tofy run -- <cmd>`.
+    pub fn run<I, A>(self, args: I)
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<String>,
+    {
+        let root = workdir();
+        let args: Vec<String> = args.into_iter().map(Into::into).collect();
+        if let Err(e) = crate::cli::run_command(&root, &args) {
+            eprintln!("tofy: {e}");
+            std::process::exit(e.exit_code());
+        }
+    }
+}
+
+fn workdir() -> PathBuf {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--dir" {
+            if let Some(d) = args.next() {
+                return PathBuf::from(d);
+            }
+        } else if let Some(d) = a.strip_prefix("--dir=") {
+            return PathBuf::from(d);
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn postgres(name: impl Into<String>) -> Postgres<Open> {
     Postgres {
         name: name.into(),
         version: None,
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
+        _state: PhantomData,
     }
 }
 
-pub fn redis(name: impl Into<String>) -> Redis {
+pub fn redis(name: impl Into<String>) -> Redis<Open> {
     Redis {
         name: name.into(),
         version: None,
@@ -188,10 +309,11 @@ pub fn redis(name: impl Into<String>) -> Redis {
         size: Size::Small,
         bind: Bind::Localhost,
         replicas: 1,
+        _state: PhantomData,
     }
 }
 
-pub fn bucket(name: impl Into<String>) -> Bucket {
+pub fn bucket(name: impl Into<String>) -> Bucket<Open> {
     Bucket {
         name: name.into(),
         version: None,
@@ -199,18 +321,16 @@ pub fn bucket(name: impl Into<String>) -> Bucket {
         size: Size::Small,
         bind: Bind::Localhost,
         replicas: 1,
+        _state: PhantomData,
     }
 }
 
-pub fn stack(name: impl Into<String>) -> Stack {
-    DECLARED.with(|slot| {
-        *slot.borrow_mut() = Some(Project::new(name));
-    });
-    Stack
-}
-
-pub fn take_project() -> Option<Project> {
-    DECLARED.with(|slot| slot.borrow_mut().take())
+pub fn stack(name: impl Into<String>) -> Stack<Empty> {
+    mark_stack_open();
+    Stack {
+        project: Project::new(name),
+        _state: PhantomData,
+    }
 }
 
 #[cfg(test)]
@@ -226,8 +346,7 @@ mod tests {
             .bind(Bind::Localhost);
         let cache = redis("cache").replicas(2).size(Size::Medium);
         let files = bucket("uploads");
-        stack("demo").add(db).add(cache).add(files);
-        let project = take_project().unwrap();
+        let project = stack("demo").add(db).add(cache).add(files).into_project();
         assert_eq!(project.project, "demo");
         assert_eq!(project.docker_network(), "tofy-demo");
         assert_eq!(project.resources.len(), 3);

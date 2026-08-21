@@ -27,3 +27,4 @@ tofy-spec.workspace = true
 
 [dev-dependencies]
 tempfile = "=3.14.0"
+trybuild = "=1.0.101"

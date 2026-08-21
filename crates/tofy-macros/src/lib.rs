@@ -4,8 +4,8 @@ use syn::{parse_macro_input, ItemFn};
 
 /// Turns a stack declaration `fn main` into a tofy program.
 ///
-/// `cargo run` applies. Pass `plan`, `apply`, `destroy`, `output`, `run`, or
-/// `emit` after `--` to choose a command.
+/// Call `stack(...).apply()` in `main`. That is apply. Pass `plan`, `destroy`,
+/// `output`, `run`, or `emit` after `--` to choose another command.
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut func = parse_macro_input!(item as ItemFn);
@@ -25,7 +25,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #vis fn main() {
             #user_ident();
-            if let Err(e) = ::tofy::rt::dispatch() {
+            if let Err(e) = ::tofy::rt::finish() {
                 eprintln!("tofy: {e}");
                 ::std::process::exit(e.exit_code());
             }

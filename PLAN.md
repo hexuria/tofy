@@ -4,7 +4,8 @@
 
 Rust is the written source. Builders and `#[tofy::main]` emit a language-agnostic spec (`Project` / `Resource` / `Kind` in `tofy-spec`). The engine plans against `.tofy/state.json` and applies with a local Docker backend.
 
-- Public API: `postgres` / `redis` / `bucket` / `stack`, plus `Size` and `Bind`
+- Public API: typestate builders (`Postgres<Open>`, `Stack<Empty/NonEmpty/Applied>`), `Size`, `Bind`
+- `.apply()` on a non-empty stack is apply; empty stack cannot apply
 - `cargo run` in `examples/infra` is apply
 - CLI: `tofy --dir <path> plan|apply|destroy|output|run|emit`
 - `tofy apply --spec spec.json` applies IR without compiling Rust

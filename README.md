@@ -15,11 +15,11 @@ fn main() {
         .size(Size::Small);
     let cache = redis("cache");
     let files = bucket("uploads");
-    stack("demo").add(db).add(cache).add(files);
+    stack("demo").add(db).add(cache).add(files).apply();
 }
 ```
 
-`postgres()` returns a declaration, not a live connection. `cargo run` in the infra crate is apply.
+`postgres()` returns a declaration, not a live connection. Builders are typestate: `postgres` has no `.replicas()`, `stack("demo")` has no `.apply()` until you `.add` a resource, and after `.apply()` you cannot `.add` again. `.apply()` on the stack is apply (`cargo run` in the infra crate).
 
 Each stack gets a private Docker network (`tofy-demo` here). Resources resolve each other by name (`appdb`, `cache`, `uploads`). You do not declare a network. Published ports default to `127.0.0.1`; use `.bind(Bind::All)` for `0.0.0.0`.
 

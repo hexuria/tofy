@@ -208,7 +208,7 @@ fn forward_to_declaration(dir: &Path, cli: &Cli, cmd: &Cmd) -> Result<()> {
     Ok(())
 }
 
-fn run_command(root: &Path, args: &[String]) -> Result<()> {
+pub(crate) fn run_command(root: &Path, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::Usage("tofy run -- <command>".into()));
     }
