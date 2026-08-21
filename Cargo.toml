@@ -4,6 +4,7 @@ members = [
     "crates/tofy-spec",
     "crates/tofy-macros",
     "crates/tofy",
+    "crates/tofy-pg",
     "examples/infra",
     "examples/infra-tofu",
     "examples/infra-aws",
