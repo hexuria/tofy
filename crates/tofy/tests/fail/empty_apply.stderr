@@ -1,0 +1,8 @@
+error[E0599]: no method named `apply` found for struct `Stack<tofy::builder::Empty>` in the current scope
+ --> tests/fail/empty_apply.rs:4:16
+  |
+4 |     stack("d").apply();
+  |                ^^^^^ method not found in `Stack<Empty>`
+  |
+  = note: the method was found for
+          - `Stack<NonEmpty>`

@@ -1,0 +1,9 @@
+error[E0599]: no method named `add` found for struct `Stack<tofy::builder::Applied>` in the current scope
+ --> tests/fail/applied_add.rs:6:13
+  |
+6 |     applied.add(extra);
+  |             ^^^ method not found in `Stack<Applied>`
+  |
+  = note: the method was found for
+          - `Stack<NonEmpty>`
+          - `Stack<tofy::builder::Empty>`

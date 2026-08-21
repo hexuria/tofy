@@ -1,0 +1,13 @@
+[package]
+name = "tofy-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Language-agnostic resource spec (IR) for tofy"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

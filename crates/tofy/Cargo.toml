@@ -1,0 +1,32 @@
+[package]
+name = "tofy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rust control language for infrastructure: declare, plan, apply"
+
+[lib]
+name = "tofy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tofy"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "=4.5.32", features = ["derive"] }
+hex = "=0.4.3"
+hmac = "=0.12.1"
+rand = "=0.8.5"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.8"
+thiserror.workspace = true
+tofy-macros.workspace = true
+tofy-spec.workspace = true
+
+[dev-dependencies]
+tempfile = "=3.14.0"
+trybuild = "=1.0.101"
