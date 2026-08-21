@@ -283,7 +283,17 @@ pub fn wait_for_postgres(container: &str, port: u16) -> Result<()> {
 
 fn pg_ready(container: &str, port: u16) -> bool {
     let exec_ok = Command::new("docker")
-        .args(["exec", container, "pg_isready", "-U", "tofy"])
+        .args([
+            "exec",
+            container,
+            "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            "5432",
+            "-U",
+            "tofy",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

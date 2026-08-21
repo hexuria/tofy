@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Real provision smoke: apply the public infra crate, probe, destroy.
+# Real provision smoke: apply the public infra crate, probe published host ports, destroy.
 # Must fail if Docker is missing. Do not skip.
 set -euo pipefail
 
 ROOT="${TOFY_SMOKE_DIR:-examples/infra}"
 BIN=(cargo run -q -p tofy -- --dir "$ROOT")
+export TOFY_SMOKE_ROOT="$ROOT"
 
 if ! docker info >/dev/null 2>&1; then
   echo "Docker is required for this smoke; refusing to treat emit-only as success."
@@ -45,9 +46,44 @@ for name, r in resources.items():
 print("all resources status=applied:", ", ".join(sorted(resources)))
 PY
 
+echo "== load published ports from outputs =="
+if [[ ! -f "$ROOT/.tofy/outputs.json" && ! -f "$ROOT/.tofy/outputs.env" ]]; then
+  echo "apply did not write .tofy/outputs.json or outputs.env"
+  exit 1
+fi
+eval "$(python3 - <<'PY'
+import json, os, pathlib, shlex, sys
+
+root = pathlib.Path(os.environ["TOFY_SMOKE_ROOT"]) / ".tofy"
+js, envp = root / "outputs.json", root / "outputs.env"
+data = {}
+if js.exists():
+    data = json.loads(js.read_text())
+elif envp.exists():
+    for line in envp.read_text().splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value
+need = [
+    "TOFY_APPDB_PORT",
+    "TOFY_CACHE_PORT",
+    "TOFY_UPLOADS_PORT",
+    "TOFY_NETWORK",
+    "TOFY_APPDB_URI",
+]
+missing = [k for k in need if not data.get(k)]
+if missing:
+    sys.exit("outputs missing keys: " + ", ".join(missing))
+for key in need:
+    print(f"{key}={shlex.quote(str(data[key]))}")
+PY
+)"
+echo "TOFY_APPDB_PORT=$TOFY_APPDB_PORT TOFY_CACHE_PORT=$TOFY_CACHE_PORT TOFY_UPLOADS_PORT=$TOFY_UPLOADS_PORT TOFY_NETWORK=$TOFY_NETWORK"
+
 echo "== containers are running =="
 running_names="$(docker ps --format '{{.Names}}')"
-for name in tofy-demo-appdb tofy-demo-cache; do
+for name in tofy-demo-appdb tofy-demo-cache tofy-demo-uploads; do
   if ! grep -qx "$name" <<<"$running_names"; then
     echo "container $name is not running"
     docker ps -a
@@ -56,37 +92,65 @@ for name in tofy-demo-appdb tofy-demo-cache; do
   echo "running $name"
 done
 
-echo "== postgres accepts connections =="
-docker exec tofy-demo-appdb pg_isready -U tofy
-python3 - <<'PY'
-import socket, time, sys
-deadline = time.time() + 30
-while time.time() < deadline:
-    s = socket.socket()
-    s.settimeout(1)
-    try:
-        s.connect(("127.0.0.1", 5433))
-        s.close()
-        print("tcp 127.0.0.1:5433 ok")
-        sys.exit(0)
-    except OSError:
-        time.sleep(0.3)
-sys.exit("Postgres did not accept TCP on 127.0.0.1:5433")
-PY
+pg_isready_host() {
+  # Probe the published host port. Never the default unix socket.
+  if command -v pg_isready >/dev/null 2>&1; then
+    pg_isready -h 127.0.0.1 -p "$TOFY_APPDB_PORT"
+  else
+    docker run --rm --network host postgres:16 \
+      pg_isready -h 127.0.0.1 -p "$TOFY_APPDB_PORT"
+  fi
+}
 
-echo "== redis PING =="
-pong="$(docker exec tofy-demo-cache redis-cli PING)"
-if [[ "$pong" != "PONG" ]]; then
-  echo "redis-cli PING => $pong"
+echo "== postgres accepts connections on published host port =="
+ready=0
+deadline=$((SECONDS + 30))
+while (( SECONDS < deadline )); do
+  if pg_isready_host; then
+    ready=1
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$ready" -ne 1 ]]; then
+  echo "pg_isready -h 127.0.0.1 -p $TOFY_APPDB_PORT failed for ~30s"
   exit 1
 fi
-python3 - <<'PY'
-import socket, sys
-s = socket.socket()
-s.settimeout(2)
-s.connect(("127.0.0.1", 6379))
-s.close()
-print("tcp 127.0.0.1:6379 ok")
+
+echo "== redis on published host port =="
+if command -v redis-cli >/dev/null 2>&1; then
+  pong="$(redis-cli -h 127.0.0.1 -p "$TOFY_CACHE_PORT" ping)"
+  if [[ "$pong" != "PONG" ]]; then
+    echo "redis-cli -h 127.0.0.1 -p $TOFY_CACHE_PORT ping => $pong"
+    exit 1
+  fi
+  echo "redis-cli PONG on 127.0.0.1:$TOFY_CACHE_PORT"
+fi
+python3 - <<PY
+import socket, sys, time
+
+def wait_tcp(port, seconds=30):
+    deadline = time.time() + seconds
+    last = None
+    while time.time() < deadline:
+        s = socket.socket()
+        s.settimeout(1)
+        try:
+            s.connect(("127.0.0.1", port))
+            s.close()
+            return
+        except OSError as e:
+            last = e
+            time.sleep(0.3)
+    sys.exit(f"127.0.0.1:{port} did not accept TCP ({last})")
+
+for label, port in (
+    ("postgres", int("$TOFY_APPDB_PORT")),
+    ("redis", int("$TOFY_CACHE_PORT")),
+    ("uploads", int("$TOFY_UPLOADS_PORT")),
+):
+    wait_tcp(port)
+    print(f"tcp 127.0.0.1:{port} ({label}) ok")
 PY
 
 echo "== tofy run injects TOFY_APPDB_URI =="
@@ -95,15 +159,18 @@ import os, sys
 u = os.environ.get("TOFY_APPDB_URI", "")
 if not u.startswith("postgres://"):
     sys.exit("TOFY_APPDB_URI missing or not a postgres uri")
-if "@127.0.0.1:5433/" not in u:
+if "@127.0.0.1:" not in u:
     sys.exit("TOFY_APPDB_URI is not the host loopback uri")
+port = os.environ.get("TOFY_APPDB_PORT", "")
+if port and f"@127.0.0.1:{port}/" not in u:
+    sys.exit(f"TOFY_APPDB_URI port does not match TOFY_APPDB_PORT={port}")
 print("TOFY_APPDB_URI is set for the host")
 '
 
 echo "== destroy =="
 "${BIN[@]}" destroy
 
-echo "== containers are gone =="
+echo "== containers and stack network are gone =="
 leftover_names="$(docker ps -a --format '{{.Names}}')"
 for name in tofy-demo-appdb tofy-demo-cache tofy-demo-uploads; do
   if grep -qx "$name" <<<"$leftover_names"; then
@@ -112,7 +179,12 @@ for name in tofy-demo-appdb tofy-demo-cache tofy-demo-uploads; do
     exit 1
   fi
 done
-echo "destroy removed stack containers"
+if docker network inspect "$TOFY_NETWORK" >/dev/null 2>&1; then
+  echo "stack network $TOFY_NETWORK still exists after destroy"
+  docker network ls
+  exit 1
+fi
+echo "destroy removed stack containers and $TOFY_NETWORK"
 
 if [[ -f "$ROOT/.tofy/outputs.env" ]]; then
   echo "outputs.env still present after destroy"

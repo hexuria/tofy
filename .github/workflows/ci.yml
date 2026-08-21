@@ -41,5 +41,8 @@ jobs:
       - name: Require Docker
         run: docker info
 
+      - name: Install host probe clients
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client redis-tools
+
       - name: Apply, probe, and destroy
         run: bash scripts/ci-smoke.sh
