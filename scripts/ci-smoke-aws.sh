@@ -20,7 +20,7 @@ tofu version
 
 echo "== emit (public path: cargo run -p $PKG emit, Backend::Aws) =="
 set +e
-cargo run -p "$PKG" -- --dir "$ROOT" emit | tee /tmp/tofy-aws-emit.log
+cargo run -p "$PKG" -- --dir "$ROOT" emit 2>&1 | tee /tmp/tofy-aws-emit.log
 EMIT_EC=${PIPESTATUS[0]}
 set -e
 if [[ "$EMIT_EC" -ne 0 ]]; then
@@ -102,7 +102,7 @@ env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
   -u AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -u AWS_CONTAINER_CREDENTIALS_FULL_URI \
   -u AWS_WEB_IDENTITY_TOKEN_FILE \
   HOME="$EMPTY_HOME" \
-  cargo run -p "$PKG" -- --dir "$ROOT" apply | tee /tmp/tofy-aws-apply.log
+  cargo run -p "$PKG" -- --dir "$ROOT" apply 2>&1 | tee /tmp/tofy-aws-apply.log
 APPLY_EC=${PIPESTATUS[0]}
 set -e
 if [[ "$APPLY_EC" -eq 0 ]]; then
@@ -147,7 +147,7 @@ env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
   -u AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -u AWS_CONTAINER_CREDENTIALS_FULL_URI \
   -u AWS_WEB_IDENTITY_TOKEN_FILE \
   HOME="$EMPTY_HOME" \
-  cargo run -p "$PKG" -- --dir "$ROOT" plan | tee /tmp/tofy-aws-plan.log
+  cargo run -p "$PKG" -- --dir "$ROOT" plan 2>&1 | tee /tmp/tofy-aws-plan.log
 PLAN_EC=${PIPESTATUS[0]}
 set -e
 if [[ "$PLAN_EC" -eq 0 ]]; then
