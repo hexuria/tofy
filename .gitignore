@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.tofy/
+docker-compose.yml
+.idea
+.vscode
