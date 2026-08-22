@@ -2,23 +2,29 @@
 
 The written source is Rust. Builders are typestate: every builder is `Foo<S>` with `_state: PhantomData<S>` and a zero-sized state type. Methods that are illegal in a state **do not exist** on that impl (not `#[deprecated]`, not a runtime error).
 
-`use tofy::prelude::*;` exports `postgres`, `mysql`, `redis`, `bucket`, `stack`, `Size`, `Bind`, `Backend`, and the `main` macro. `#[tofy::main]` still wraps `fn main`.
+`use tofy::prelude::*;` exports `postgres`, `mysql`, `redis`, `bucket`, `secret`, `stack`, `Size`, `Bind`, `Backend`, and the `main` macro. `#[tofy::main]` still wraps `fn main`.
 
 ## Resource builders
 
 `postgres("appdb")` → `Postgres<Open>`  
 `mysql("appmysql")` → `Mysql<Open>`  
 `redis("cache")` → `Redis<Open>`  
-`bucket("uploads")` → `Bucket<Open>`
+`bucket("uploads")` → `Bucket<Open>`  
+`secret("signing")` → `Secret<Open>`
 
 `Open` stays `Open` after setters. Adding a resource to a stack **consumes** it (move). There is no `.build()`.
 
 | Type | Methods on `Open` | Not on this type |
 | --- | --- | --- |
-| `Postgres<Open>` | `version`, `port`, `size`, `bind`, `replicas` | `apply`, `add` |
-| `Mysql<Open>` | `version`, `port`, `size`, `bind`, `replicas` | `apply`, `add` |
-| `Redis<Open>` | `version`, `port`, `size`, `bind`, `replicas` | `apply`, `add` |
-| `Bucket<Open>` | `version`, `port`, `size`, `bind` | `replicas`, `apply`, `add` |
+| `Postgres<Open>` | `version`, `port`, `size`, `bind`, `replicas`, `export`, `export_key` | `apply`, `add` |
+| `Mysql<Open>` | `version`, `port`, `size`, `bind`, `replicas`, `export`, `export_key` | `apply`, `add` |
+| `Redis<Open>` | `version`, `port`, `size`, `bind`, `replicas`, `export`, `export_key` | `apply`, `add` |
+| `Bucket<Open>` | `version`, `port`, `size`, `bind`, `export`, `export_key` | `replicas`, `apply`, `add` |
+| `Secret<Open>` | `export`, `export_key` | `replicas`, `version`, `port`, `size`, `bind`, `apply`, `add` |
+
+`.export("OAG_DATABASE__URL")` records a consumer env name for the default output key (`uri` for postgres / mysql / redis, `endpoint` for bucket, `value` for secret). `.export_key(env, key)` picks another output (`password`, `host`, …). After apply, `tofy run` and `outputs.env` / `outputs.json` contain both `TOFY_<RESOURCE>_<KEY>` and the alias, same value. Env names must be `[A-Z0-9_]+` (no spaces). The same `exports` array is in the JSON IR so `--spec` and other languages can set them. `.export` is on the Open resource builder (part of the declaration), not on `Stack<Applied>`.
+
+`secret("signing")` is not a container. Apply generates a high-entropy value once, persists it in `.tofy/state.json` (mode `0600`), and writes `TOFY_SIGNING_VALUE`. Re-apply does not rotate it. Destroy clears it. Plan is create or noop (no live Docker/AWS drift). Local / Tofu / Aws emit no Docker or AWS resource for it. `tofy output` redacts secret values and their aliases.
 
 `size` takes `Size { Small, Medium, Large }`, not a loose string.  
 `bind` takes `Bind::Localhost` (`127.0.0.1` on Docker backends) or `Bind::All` (`0.0.0.0`). On `Backend::Aws`, `Localhost` is SG ingress from the applying machine's public IPv4 `/32` (not loopback, not a silent `0.0.0.0/0`); `All` opens SG ingress to `0.0.0.0/0`. RDS is publicly reachable from that CIDR. ElastiCache has no public IP, so Redis stays VPC-only even with the same SG. Laptop Redis requires a VPN or an SSH/SSM tunnel (`scripts/redis-tunnel.sh`); ElastiCache will not get a public IP.
@@ -51,6 +57,7 @@ These do not compile. trybuild covers them under `crates/tofy/tests/fail/`.
 
 ```rust
 bucket("x").replicas(2);             // no replicas on Bucket<Open>
+secret("x").replicas(2);             // no replicas on Secret<Open>
 stack("d").apply();                  // no apply on Stack<Empty>
 stack("d").add(postgres("x")).apply().add(postgres("y")); // no add on Stack<Applied>
 ```
@@ -61,13 +68,13 @@ Illegal `Size` values fail at compile time (`Size::Huge` does not exist).
 
 After apply, other languages **do not** import tofy.
 
-- `tofy run -- <cmd>` injects `TOFY_*` and execs
+- `tofy run -- <cmd>` injects `TOFY_*` plus any `.export` aliases and execs
 - or read `.tofy/outputs.env` / `.tofy/outputs.json`
 - Rust-only opt-in: crate `tofy-pg` (`pool_from_env` / `pool_from_outputs`) plus `Stack<Applied>::uri(&self, name)` which returns the host URI string. `#[tofy::main]` stays sync. Other languages stay on env.
 
 `TOFY_APPDB_URI` is the host URI for the laptop. On local / Tofu that is loopback; a sibling container on the private network uses `TOFY_APPDB_INTERNAL_URI` (`…@appdb:5432/…`). Redis is the same shape with a password: local / Tofu `TOFY_CACHE_URI` is `redis://:<password>@127.0.0.1:…`. On `Backend::Aws`, `TOFY_APPDB_URI` is the RDS endpoint (reachable from the applying machine) and `TOFY_CACHE_URI` is `rediss://:<password>@<elasticache-host>:…` (TLS). That Redis URI is for in-VPC or VPN clients — ElastiCache is not reachable from the public internet. `TOFY_CACHE_URI` from apply remains the ElastiCache `rediss://` host (in-VPC). After tunneling, the laptop uses `127.0.0.1`, not that hostname, unless DNS/VPN already routes there. Optional helper: `scripts/redis-tunnel.sh` (not invoked by apply).
 
-The JSON IR (`Project` / `Resource` / `Kind` / `Backend` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml.
+The JSON IR (`Project` / `Resource` / `Kind` / `Backend` / `Export` in `tofy-spec`) is what the engine consumes. `tofy apply --spec spec.json` applies that IR without compiling Rust. Humans write the Rust file, not yaml. An IR resource may include `"exports": [{"env": "OAG_DATABASE__URL"}]` or `{"env": "APP_PASSWORD", "key": "password"}`.
 
 `tofy import compose <file>` maps a **constrained** Docker Compose subset (official `postgres` / `mysql` / `redis` / `minio/minio` images, ports, `mem_limit`) onto that same JSON IR. It writes spec JSON (or stdout). It does not apply, does not auto-load yaml, and `--spec` still rejects `.yaml` / `.yml`. Unknown images fail; Compose env passwords are not copied into the spec.
 
@@ -75,7 +82,7 @@ When `backend` is `tofu`, apply and plan run the OpenTofu engine against an emit
 
 ## AWS mapping
 
-Language stays `postgres` / `mysql` / `redis` / `bucket`. No `.vpc()`, `.instanceClass()`, or `.multiAz()` on the builders. `.replicas(n)` exists on postgres / mysql / redis Open; Aws still rejects `replicas > 1`.
+Language stays `postgres` / `mysql` / `redis` / `bucket` / `secret`. No `.vpc()`, `.instanceClass()`, or `.multiAz()` on the builders. `.replicas(n)` exists on postgres / mysql / redis Open; Aws still rejects `replicas > 1`. `secret` is state-only on every backend.
 
 | kind | AWS resource | Small | Medium | Large |
 | --- | --- | --- | --- | --- |
@@ -83,6 +90,7 @@ Language stays `postgres` / `mysql` / `redis` / `bucket`. No `.vpc()`, `.instanc
 | `mysql` | RDS instance | `db.t4g.micro` | `db.t4g.small` | `db.t4g.medium` |
 | `redis` | ElastiCache Redis (1 node) | `cache.t4g.micro` | `cache.t4g.small` | `cache.t4g.medium` |
 | `bucket` | S3 | `STANDARD` | `STANDARD` | `STANDARD` |
+| `secret` | none (state + outputs) | — | — | — |
 
 Postgres / Mysql / Redis passwords are generated once and persisted like the local backend. After apply, `TOFY_*_HOST` / `TOFY_*_URI` come from the engine. Redis on Aws is ElastiCache with in-transit encryption, so `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS), not `redis://`. The bucket is IAM-less: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT`.
 

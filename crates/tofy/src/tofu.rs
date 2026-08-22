@@ -65,6 +65,9 @@ pub fn destroy(root: &Path, state: &State) -> Result<()> {
 
 fn wait_ready(spec: &Project, state: &State) -> Result<()> {
     for r in &spec.resources {
+        if !r.kind.is_runtime() {
+            continue;
+        }
         let rs = state
             .resources
             .get(&r.name)

@@ -18,6 +18,12 @@ pub fn flatten(state: &State) -> BTreeMap<String, String> {
         for (key, value) in &res.outputs {
             out.insert(env_var(name, key), value.clone());
         }
+        for export in &res.exports {
+            let key = export.output_key(res.kind);
+            if let Some(value) = res.outputs.get(key) {
+                out.insert(export.env.clone(), value.clone());
+            }
+        }
     }
     out
 }
@@ -114,5 +120,51 @@ mod tests {
         assert!(public.contains("TOFY_CACHE_PORT=6379"));
         assert!(public.contains("TOFY_APPDB_INTERNAL_HOST=appdb"));
         assert!(public.contains("TOFY_NETWORK=tofy-demo"));
+    }
+
+    #[test]
+    fn flatten_includes_export_aliases_and_redacts_secrets() {
+        let mut spec = Project::new("oag");
+        spec.resources.push(
+            Resource::new("appdb", Kind::Postgres)
+                .with_port(5452)
+                .with_export("OAG_DATABASE__URL"),
+        );
+        spec.resources
+            .push(Resource::new("cache", Kind::Redis).with_export("OAG_REDIS__URL"));
+        spec.resources.push(
+            Resource::new("signing", Kind::Secret).with_export("OAG_SECURITY__SIGNING_SECRET"),
+        );
+        spec.resources
+            .push(Resource::new("kek", Kind::Secret).with_export("OAG_SECURITY__CREDENTIAL_KEK"));
+        spec.resources
+            .push(Resource::new("uploads", Kind::Bucket).with_export("APP_OBJECT_ENDPOINT"));
+        let state = prepare_state(&spec, &State::default());
+        let flat = flatten(&state);
+        assert_eq!(flat["OAG_DATABASE__URL"], flat["TOFY_APPDB_URI"]);
+        assert_eq!(flat["OAG_REDIS__URL"], flat["TOFY_CACHE_URI"]);
+        assert_eq!(
+            flat["OAG_SECURITY__SIGNING_SECRET"],
+            flat["TOFY_SIGNING_VALUE"]
+        );
+        assert_eq!(flat["OAG_SECURITY__CREDENTIAL_KEK"], flat["TOFY_KEK_VALUE"]);
+        assert_eq!(flat["APP_OBJECT_ENDPOINT"], flat["TOFY_UPLOADS_ENDPOINT"]);
+        let public = format_public(&flat);
+        assert!(!public.contains(&flat["TOFY_SIGNING_VALUE"]));
+        assert!(!public.contains(&flat["TOFY_KEK_VALUE"]));
+        assert!(!public.contains(&flat["OAG_DATABASE__URL"]));
+        assert!(!public.contains("OAG_SECURITY__SIGNING_SECRET"));
+        assert!(!public.contains("TOFY_SIGNING_VALUE"));
+        assert!(public.contains("APP_OBJECT_ENDPOINT="));
+        assert!(public.contains("TOFY_UPLOADS_ENDPOINT="));
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &state).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded["OAG_DATABASE__URL"], loaded["TOFY_APPDB_URI"]);
+        assert_eq!(
+            loaded["OAG_SECURITY__SIGNING_SECRET"],
+            loaded["TOFY_SIGNING_VALUE"]
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tofy_spec::{internal_host, Backend, Bind, Kind, Project, Resource, Size};
+use tofy_spec::{internal_host, Backend, Bind, Export, Kind, Project, Resource, Size};
 
 use crate::error::Result;
 
@@ -29,6 +29,8 @@ pub struct ResourceState {
     #[serde(default = "default_replicas")]
     pub replicas: u32,
     pub outputs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<Export>,
 }
 
 fn default_replicas() -> u32 {
@@ -86,10 +88,15 @@ impl State {
                 name: name.clone(),
                 kind: rs.kind,
                 version: rs.version.clone(),
-                port: Some(rs.port),
+                port: if rs.kind == Kind::Secret {
+                    None
+                } else {
+                    Some(rs.port)
+                },
                 size: rs.size,
                 bind: rs.bind,
                 replicas: rs.replicas,
+                exports: rs.exports.clone(),
             });
         }
         project
@@ -112,6 +119,7 @@ pub fn docker_image(r: &Resource) -> String {
         Kind::Mysql => format!("mysql:{}", r.version_or_default()),
         Kind::Redis => format!("redis:{}", r.version_or_default()),
         Kind::Bucket => format!("minio/minio:{}", r.version_or_default()),
+        Kind::Secret => "secret".into(),
     }
 }
 
@@ -120,6 +128,7 @@ fn aws_image(r: &Resource) -> String {
         Kind::Postgres | Kind::Mysql => r.size.aws_rds_instance_class().to_string(),
         Kind::Redis => r.size.aws_elasticache_node_type().to_string(),
         Kind::Bucket => format!("s3:{}", r.size.aws_s3_storage_class()),
+        Kind::Secret => "secret".into(),
     }
 }
 
@@ -157,6 +166,7 @@ pub fn prepare_state(spec: &Project, current: &State) -> State {
                 bind: r.bind,
                 replicas: r.replicas_or_default(),
                 outputs: outputs_for(spec, r, have),
+                exports: r.exports.clone(),
             },
         );
     }
@@ -182,6 +192,11 @@ pub fn outputs_for(
     let internal_port = r.kind.internal_port();
     let in_host = internal_host(&r.name);
     let mut out = BTreeMap::new();
+    if r.kind == Kind::Secret {
+        let value = existing_output(have, "value").unwrap_or_else(|| generate_secret(32));
+        out.insert("value".into(), value);
+        return out;
+    }
     out.insert("bind".into(), r.bind.as_ip().to_string());
     out.insert("size".into(), r.size.as_str().to_string());
     out.insert("replicas".into(), r.replicas_or_default().to_string());
@@ -277,6 +292,10 @@ fn local_outputs_for(
             out.insert("internal_host".into(), in_host.to_string());
             out.insert("internal_port".into(), internal_port.to_string());
         }
+        Kind::Secret => {
+            let value = existing_output(have, "value").unwrap_or_else(|| generate_secret(32));
+            out.insert("value".into(), value);
+        }
     }
 }
 
@@ -347,6 +366,10 @@ fn aws_outputs_for(
                 );
                 out.insert("region".into(), region);
             }
+        }
+        Kind::Secret => {
+            let value = existing_output(have, "value").unwrap_or_else(|| generate_secret(32));
+            out.insert("value".into(), value);
         }
     }
 }
@@ -511,6 +534,30 @@ mod tests {
         with_cidr.applier_cidr = Some("203.0.113.10/32".into());
         let third = prepare_state(&spec, &with_cidr);
         assert_eq!(third.applier_cidr.as_deref(), Some("203.0.113.10/32"));
+    }
+
+    #[test]
+    fn secret_generated_once_and_not_rotated() {
+        let mut spec = Project::new("oag");
+        spec.resources.push(
+            Resource::new("signing", Kind::Secret).with_export("OAG_SECURITY__SIGNING_SECRET"),
+        );
+        let first = prepare_state(&spec, &State::default());
+        let value = first.resources["signing"].outputs["value"].clone();
+        assert_eq!(value.len(), 32);
+        assert!(!value.is_empty());
+        assert_eq!(
+            first.resources["signing"].exports[0].env,
+            "OAG_SECURITY__SIGNING_SECRET"
+        );
+        let second = prepare_state(&spec, &first);
+        assert_eq!(value, second.resources["signing"].outputs["value"]);
+        assert_eq!(first.resources["signing"].image, "secret");
+        assert_eq!(second.as_project().resources[0].kind, Kind::Secret);
+        assert_eq!(
+            second.as_project().resources[0].exports[0].env,
+            "OAG_SECURITY__SIGNING_SECRET"
+        );
     }
 
     #[test]

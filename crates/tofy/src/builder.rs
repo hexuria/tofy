@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use tofy_spec::{Backend, Bind, Kind, Project, Resource, Size};
+use tofy_spec::{Backend, Bind, Export, Kind, Project, Resource, Size};
 
 thread_local! {
     static OPEN_STACK: Cell<bool> = const { Cell::new(false) };
@@ -39,9 +39,10 @@ impl ResourceDecl for Postgres<Open> {}
 impl ResourceDecl for Mysql<Open> {}
 impl ResourceDecl for Redis<Open> {}
 impl ResourceDecl for Bucket<Open> {}
+impl ResourceDecl for Secret<Open> {}
 
 /// Postgres resource declaration. Not a database client.
-/// `Postgres<Open>` has version/port/size/bind/replicas.
+/// `Postgres<Open>` has version/port/size/bind/replicas/export.
 #[derive(Debug, Clone)]
 pub struct Postgres<S> {
     name: String,
@@ -50,6 +51,7 @@ pub struct Postgres<S> {
     size: Size,
     bind: Bind,
     replicas: u32,
+    exports: Vec<Export>,
     _state: PhantomData<S>,
 }
 
@@ -78,6 +80,18 @@ impl Postgres<Open> {
         self.replicas = n;
         self
     }
+
+    /// Also inject the host URI under `env_name` (`tofy run` / outputs).
+    pub fn export(mut self, env_name: impl Into<String>) -> Self {
+        self.exports.push(Export::new(env_name));
+        self
+    }
+
+    /// Also inject a named output key under `env_name`.
+    pub fn export_key(mut self, env_name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.exports.push(Export::with_key(env_name, key));
+        self
+    }
 }
 
 impl From<Postgres<Open>> for Resource {
@@ -90,12 +104,13 @@ impl From<Postgres<Open>> for Resource {
             size: p.size,
             bind: p.bind,
             replicas: p.replicas,
+            exports: p.exports,
         }
     }
 }
 
 /// Mysql resource declaration. Not a database client.
-/// `Mysql<Open>` has version/port/size/bind/replicas.
+/// `Mysql<Open>` has version/port/size/bind/replicas/export.
 #[derive(Debug, Clone)]
 pub struct Mysql<S> {
     name: String,
@@ -104,6 +119,7 @@ pub struct Mysql<S> {
     size: Size,
     bind: Bind,
     replicas: u32,
+    exports: Vec<Export>,
     _state: PhantomData<S>,
 }
 
@@ -132,6 +148,18 @@ impl Mysql<Open> {
         self.replicas = n;
         self
     }
+
+    /// Also inject the host URI under `env_name` (`tofy run` / outputs).
+    pub fn export(mut self, env_name: impl Into<String>) -> Self {
+        self.exports.push(Export::new(env_name));
+        self
+    }
+
+    /// Also inject a named output key under `env_name`.
+    pub fn export_key(mut self, env_name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.exports.push(Export::with_key(env_name, key));
+        self
+    }
 }
 
 impl From<Mysql<Open>> for Resource {
@@ -144,12 +172,13 @@ impl From<Mysql<Open>> for Resource {
             size: p.size,
             bind: p.bind,
             replicas: p.replicas,
+            exports: p.exports,
         }
     }
 }
 
 /// Redis resource declaration. Not a live client.
-/// `Redis<Open>` has version/port/size/bind/replicas.
+/// `Redis<Open>` has version/port/size/bind/replicas/export.
 #[derive(Debug, Clone)]
 pub struct Redis<S> {
     name: String,
@@ -158,6 +187,7 @@ pub struct Redis<S> {
     size: Size,
     bind: Bind,
     replicas: u32,
+    exports: Vec<Export>,
     _state: PhantomData<S>,
 }
 
@@ -186,6 +216,18 @@ impl Redis<Open> {
         self.replicas = n;
         self
     }
+
+    /// Also inject the host URI under `env_name` (`tofy run` / outputs).
+    pub fn export(mut self, env_name: impl Into<String>) -> Self {
+        self.exports.push(Export::new(env_name));
+        self
+    }
+
+    /// Also inject a named output key under `env_name`.
+    pub fn export_key(mut self, env_name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.exports.push(Export::with_key(env_name, key));
+        self
+    }
 }
 
 impl From<Redis<Open>> for Resource {
@@ -198,12 +240,13 @@ impl From<Redis<Open>> for Resource {
             size: r.size,
             bind: r.bind,
             replicas: r.replicas,
+            exports: r.exports,
         }
     }
 }
 
 /// Object-storage bucket declaration. Not an SDK client.
-/// `Bucket<Open>` has version/port/size/bind. There is no `.replicas()`.
+/// `Bucket<Open>` has version/port/size/bind/export. There is no `.replicas()`.
 #[derive(Debug, Clone)]
 pub struct Bucket<S> {
     name: String,
@@ -211,6 +254,7 @@ pub struct Bucket<S> {
     port: Option<u16>,
     size: Size,
     bind: Bind,
+    exports: Vec<Export>,
     _state: PhantomData<S>,
 }
 
@@ -234,6 +278,18 @@ impl Bucket<Open> {
         self.bind = bind;
         self
     }
+
+    /// Also inject the object-store endpoint under `env_name`.
+    pub fn export(mut self, env_name: impl Into<String>) -> Self {
+        self.exports.push(Export::new(env_name));
+        self
+    }
+
+    /// Also inject a named output key under `env_name`.
+    pub fn export_key(mut self, env_name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.exports.push(Export::with_key(env_name, key));
+        self
+    }
 }
 
 impl From<Bucket<Open>> for Resource {
@@ -246,6 +302,45 @@ impl From<Bucket<Open>> for Resource {
             size: b.size,
             bind: b.bind,
             replicas: 1,
+            exports: b.exports,
+        }
+    }
+}
+
+/// Generated high-entropy value, persisted in state. Not a container.
+/// `Secret<Open>` has export only. There is no `.replicas()`, `.port()`, or `.version()`.
+#[derive(Debug, Clone)]
+pub struct Secret<S> {
+    name: String,
+    exports: Vec<Export>,
+    _state: PhantomData<S>,
+}
+
+impl Secret<Open> {
+    /// Also inject the generated value under `env_name`.
+    pub fn export(mut self, env_name: impl Into<String>) -> Self {
+        self.exports.push(Export::new(env_name));
+        self
+    }
+
+    /// Also inject a named output key under `env_name` (secret default is `value`).
+    pub fn export_key(mut self, env_name: impl Into<String>, key: impl Into<String>) -> Self {
+        self.exports.push(Export::with_key(env_name, key));
+        self
+    }
+}
+
+impl From<Secret<Open>> for Resource {
+    fn from(s: Secret<Open>) -> Self {
+        Resource {
+            name: s.name,
+            kind: Kind::Secret,
+            version: None,
+            port: None,
+            size: Size::Small,
+            bind: Bind::Localhost,
+            replicas: 1,
+            exports: s.exports,
         }
     }
 }
@@ -390,6 +485,7 @@ pub fn postgres(name: impl Into<String>) -> Postgres<Open> {
         size: Size::Small,
         bind: Bind::Localhost,
         replicas: 1,
+        exports: Vec::new(),
         _state: PhantomData,
     }
 }
@@ -402,6 +498,7 @@ pub fn mysql(name: impl Into<String>) -> Mysql<Open> {
         size: Size::Small,
         bind: Bind::Localhost,
         replicas: 1,
+        exports: Vec::new(),
         _state: PhantomData,
     }
 }
@@ -414,6 +511,7 @@ pub fn redis(name: impl Into<String>) -> Redis<Open> {
         size: Size::Small,
         bind: Bind::Localhost,
         replicas: 1,
+        exports: Vec::new(),
         _state: PhantomData,
     }
 }
@@ -425,6 +523,15 @@ pub fn bucket(name: impl Into<String>) -> Bucket<Open> {
         port: None,
         size: Size::Small,
         bind: Bind::Localhost,
+        exports: Vec::new(),
+        _state: PhantomData,
+    }
+}
+
+pub fn secret(name: impl Into<String>) -> Secret<Open> {
+    Secret {
+        name: name.into(),
+        exports: Vec::new(),
         _state: PhantomData,
     }
 }
@@ -508,5 +615,51 @@ mod tests {
         assert_eq!(via_aws.resources.len(), 3);
         let via_aws_fn = stack("demoaws").aws().add(bucket("uploads")).into_project();
         assert_eq!(via_aws_fn.backend, Backend::Aws);
+    }
+
+    #[test]
+    fn export_and_secret_on_open_builders() {
+        let db = postgres("appdb")
+            .version("18")
+            .port(5452)
+            .export("OAG_DATABASE__URL");
+        let cache = redis("cache")
+            .version("8")
+            .port(6399)
+            .export("OAG_REDIS__URL");
+        let files = bucket("uploads").export("APP_S3_ENDPOINT");
+        let sql = mysql("appmysql").export_key("APP_MYSQL_PASSWORD", "password");
+        let sign = secret("signing").export("OAG_SECURITY__SIGNING_SECRET");
+        let kek = secret("kek").export("OAG_SECURITY__CREDENTIAL_KEK");
+        let project = stack("oag")
+            .add(db)
+            .add(cache)
+            .add(files)
+            .add(sql)
+            .add(sign)
+            .add(kek)
+            .into_project();
+        assert_eq!(project.project, "oag");
+        assert_eq!(project.resources[0].exports[0].env, "OAG_DATABASE__URL");
+        assert_eq!(
+            project.resources[0].exports[0].output_key(Kind::Postgres),
+            "uri"
+        );
+        assert_eq!(project.resources[1].exports[0].env, "OAG_REDIS__URL");
+        assert_eq!(
+            project.resources[2].exports[0].output_key(Kind::Bucket),
+            "endpoint"
+        );
+        assert_eq!(
+            project.resources[3].exports[0].key.as_deref(),
+            Some("password")
+        );
+        assert_eq!(project.resources[4].kind, Kind::Secret);
+        assert_eq!(project.resources[4].name, "signing");
+        assert_eq!(
+            project.resources[5].exports[0].env,
+            "OAG_SECURITY__CREDENTIAL_KEK"
+        );
+        project.validate().unwrap();
     }
 }

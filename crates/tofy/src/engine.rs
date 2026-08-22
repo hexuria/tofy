@@ -51,40 +51,44 @@ pub fn plan_with_live(
             if have.kind != want.kind {
                 changed.push("type");
             }
-            if have.image != want.image {
-                changed.push("image");
-            }
-            if have.port != want.port {
-                changed.push("port");
-            }
-            if have.size != want.size {
-                changed.push("size");
-            }
-            if have.bind != want.bind {
-                changed.push("bind");
-            }
-            if have.replicas != want.replicas {
-                changed.push("replicas");
+            if want.kind.is_runtime() {
+                if have.image != want.image {
+                    changed.push("image");
+                }
+                if have.port != want.port {
+                    changed.push("port");
+                }
+                if have.size != want.size {
+                    changed.push("size");
+                }
+                if have.bind != want.bind {
+                    changed.push("bind");
+                }
+                if have.replicas != want.replicas {
+                    changed.push("replicas");
+                }
             }
         }
 
-        if let Some(status) = live.get(name) {
-            match status {
-                ContainerLive::Missing if have.is_some() => {
-                    create = true;
-                }
-                ContainerLive::Missing => {}
-                ContainerLive::Present(facts) => {
-                    overlay_present(
-                        facts,
-                        &want.image,
-                        want.port,
-                        want.bind.as_ip(),
-                        &spec.project,
-                        name,
-                        &mut changed,
-                        &mut not_running,
-                    );
+        if want.kind.is_runtime() {
+            if let Some(status) = live.get(name) {
+                match status {
+                    ContainerLive::Missing if have.is_some() => {
+                        create = true;
+                    }
+                    ContainerLive::Missing => {}
+                    ContainerLive::Present(facts) => {
+                        overlay_present(
+                            facts,
+                            &want.image,
+                            want.port,
+                            want.bind.as_ip(),
+                            &spec.project,
+                            name,
+                            &mut changed,
+                            &mut not_running,
+                        );
+                    }
                 }
             }
         }
@@ -163,6 +167,9 @@ fn observe_live(spec: &Project) -> BTreeMap<String, ContainerLive> {
         return live;
     }
     for r in &spec.resources {
+        if !r.kind.is_runtime() {
+            continue;
+        }
         live.insert(r.name.clone(), docker::inspect_replicas(&spec.project, r));
     }
     live
@@ -203,6 +210,9 @@ pub fn plan_text(root: &Path, spec: &Project) -> Result<String> {
             let live = observe_live(spec);
             Ok(format_actions(&plan_with_live(spec, &current, &live)))
         }
+        Backend::Tofu | Backend::Aws if !spec.has_runtime() => {
+            Ok(format_actions(&plan(spec, &current)))
+        }
         Backend::Tofu => {
             let next = prepare_state(spec, &current);
             tofu::plan(root, spec, &next)
@@ -218,6 +228,15 @@ pub fn apply(root: &Path, spec: &Project) -> Result<String> {
     spec.validate()?;
     let _lock = Lock::acquire(root)?;
     let current = State::load(root)?;
+    if !spec.has_runtime() {
+        let actions = plan(spec, &current);
+        let mut next = prepare_state(spec, &current);
+        emit::write_artifacts(root, spec, &next)?;
+        state::mark_applied(&mut next);
+        next.save(root)?;
+        outputs::write(root, &next)?;
+        return Ok(applied_message(&actions));
+    }
     let live = observe_live(spec);
     let actions = plan_with_live(spec, &current, &live);
     let mut next = prepare_state(spec, &current);
@@ -262,7 +281,7 @@ fn apply_local(
         return emit_without_engine(root, actions, next, Error::DockerMissing);
     }
 
-    if spec.resources.is_empty() {
+    if spec.resources.iter().all(|r| !r.kind.is_runtime()) {
         docker::destroy_network(&spec.project)?;
     } else {
         docker::ensure_network(&spec.project)?;
@@ -271,12 +290,22 @@ fn apply_local(
     // Deletes first so ports can be reused.
     for a in actions {
         if let Action::Delete { name, .. } = a {
-            let n = current.resources.get(name).map(|r| r.replicas).unwrap_or(1);
-            docker::destroy_resource(&current.project, name, n)?;
+            let runtime = current
+                .resources
+                .get(name)
+                .map(|r| r.kind.is_runtime())
+                .unwrap_or(true);
+            if runtime {
+                let n = current.resources.get(name).map(|r| r.replicas).unwrap_or(1);
+                docker::destroy_resource(&current.project, name, n)?;
+            }
         }
     }
 
     for r in &spec.resources {
+        if !r.kind.is_runtime() {
+            continue;
+        }
         let rs = next
             .resources
             .get(&r.name)
@@ -353,6 +382,12 @@ pub fn destroy(root: &Path) -> Result<String> {
         outputs::clear(root)?;
         return Ok("Nothing in state.\n".into());
     }
+    if current.resources.values().all(|r| !r.kind.is_runtime()) {
+        current.clear_resources();
+        current.save(root)?;
+        outputs::clear(root)?;
+        return Ok("Destroyed resources and cleared state.\n".into());
+    }
     match current.backend {
         Backend::Local => destroy_local(root, &mut current),
         Backend::Tofu => destroy_tofu(root, &mut current),
@@ -366,7 +401,9 @@ fn destroy_local(root: &Path, current: &mut State) -> Result<String> {
     }
     let project = current.project.clone();
     for (name, rs) in &current.resources {
-        docker::destroy_resource(&project, name, rs.replicas)?;
+        if rs.kind.is_runtime() {
+            docker::destroy_resource(&project, name, rs.replicas)?;
+        }
     }
     docker::destroy_network(&project)?;
     current.clear_resources();
@@ -1091,5 +1128,66 @@ mod tests {
                         .all(|r| r.status != crate::state::Status::Applied)
             );
         });
+    }
+
+    #[test]
+    fn secret_plan_is_create_then_noop_without_live_drift() {
+        let spec = spec(&[("signing", Kind::Secret, None)]);
+        let actions = plan(&spec, &State::default());
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Create { name, kind } if name == "signing" && *kind == Kind::Secret
+        )));
+        let text = format_actions(&actions);
+        assert!(text.contains("+ create  signing  (secret)"), "{text}");
+        assert!(!text.to_lowercase().contains("password"));
+        assert!(!text.contains("tofy-"));
+        let current = state_from(&spec);
+        let actions = plan(&spec, &current);
+        assert!(actions.iter().all(|a| matches!(a, Action::Noop { .. })));
+        assert_eq!(format_actions(&actions), "No changes.\n");
+        let mut live = BTreeMap::new();
+        live.insert("signing".into(), ContainerLive::Missing);
+        let actions = plan_with_live(&spec, &current, &live);
+        assert!(actions.iter().all(|a| matches!(a, Action::Noop { .. })));
+    }
+
+    #[test]
+    fn secret_apply_persists_value_and_destroy_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = spec(&[("signing", Kind::Secret, None)]);
+        spec.resources[0] =
+            Resource::new("signing", Kind::Secret).with_export("OAG_SECURITY__SIGNING_SECRET");
+        let msg = apply(dir.path(), &spec).unwrap();
+        assert!(msg.contains("Applied"), "{msg}");
+        assert!(msg.contains("+ create  signing  (secret)"), "{msg}");
+        let first = outputs::load(dir.path()).unwrap();
+        assert!(!msg.contains(&first["TOFY_SIGNING_VALUE"]), "{msg}");
+        let value = first["TOFY_SIGNING_VALUE"].clone();
+        assert_eq!(value, first["OAG_SECURITY__SIGNING_SECRET"]);
+        assert_eq!(value.len(), 32);
+        let env = dir.path().join(".tofy").join("outputs.env");
+        let env_text = std::fs::read_to_string(&env).unwrap();
+        assert!(env_text.contains("TOFY_SIGNING_VALUE="));
+        assert!(env_text.contains("OAG_SECURITY__SIGNING_SECRET="));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let msg = apply(dir.path(), &spec).unwrap();
+        assert!(msg.contains("No changes."), "{msg}");
+        let second = outputs::load(dir.path()).unwrap();
+        assert_eq!(value, second["TOFY_SIGNING_VALUE"]);
+        assert_eq!(value, second["OAG_SECURITY__SIGNING_SECRET"]);
+        let public = outputs::format_public(&second);
+        assert!(!public.contains(&value));
+        assert!(!public.contains("TOFY_SIGNING_VALUE"));
+        let destroy_msg = destroy(dir.path()).unwrap();
+        assert!(destroy_msg.contains("Destroyed"), "{destroy_msg}");
+        assert!(outputs::load(dir.path()).is_err());
+        let after = State::load(dir.path()).unwrap();
+        assert!(after.resources.is_empty());
     }
 }

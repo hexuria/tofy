@@ -2,7 +2,7 @@
 
 A Rust control language for infrastructure. You write typestate builders and `#[tofy::main]`. That is the source. Those emit a language-agnostic JSON resource spec. `apply` consumes the spec: plan against state, create / update / delete, write outputs.
 
-A Node, Go, or other app does not import tofy. It reads `TOFY_*` environment variables (or `.tofy/outputs.json`). There is no yaml happy path.
+A Node, Go, or other app does not import tofy. It reads `TOFY_*` environment variables (or `.tofy/outputs.json`). When the app already has its own names, declare `.export("APP_DATABASE_URL")` on the resource so apply writes both. There is no yaml happy path.
 
 ```rust
 use tofy::prelude::*;
@@ -29,7 +29,19 @@ stack("demoaws").backend(Backend::Aws).add(db).add(cache).add(files).apply();
 
 `examples/infra` stays `stack("demo")` on 5433 / 6379 / 9000. `examples/infra-tofu` is `stack("demotofu")` with host ports 15433 / 16379 / 19000 so both can run on one machine. `examples/infra-aws` is `stack("demoaws")` with ports 25432 / 26379 (`Backend::Aws`).
 
-`postgres()` is a declaration, not a live connection. Builders are `Foo<S>` with `PhantomData` — illegal methods do not exist on that impl. `stack("demo")` cannot `apply` until you `add` a resource. After `apply()` you cannot `add` again. See [docs/api.md](docs/api.md).
+`postgres()` is a declaration, not a live connection. `secret("signing")` is a generated value persisted in state — not a container. Builders are `Foo<S>` with `PhantomData` — illegal methods do not exist on that impl. `stack("demo")` cannot `apply` until you `add` a resource. After `apply()` you cannot `add` again. See [docs/api.md](docs/api.md).
+
+Apps that already name their own env vars use `.export` on the Open builder. Apply still writes `TOFY_*`; it also writes the alias. `examples/infra-export` is that shape (oag-style names as an example, not a special case):
+
+```rust
+let db = postgres("appdb").version("18").port(5452).export("OAG_DATABASE__URL");
+let cache = redis("cache").version("8").port(6399).export("OAG_REDIS__URL");
+let sign = secret("signing").export("OAG_SECURITY__SIGNING_SECRET");
+let kek = secret("kek").export("OAG_SECURITY__CREDENTIAL_KEK");
+stack("oag").add(db).add(cache).add(sign).add(kek).apply();
+```
+
+After apply, `tofy run` and `outputs.env` contain both `TOFY_APPDB_URI` and `OAG_DATABASE__URL` (same value), the redis pair, and the two secret values. Re-apply does not rotate a secret. Destroy clears it. `--spec` JSON can set the same `exports` array.
 
 `.apply()` on the stack is apply. `cargo run -p infra` is apply. `tofy apply` applies whatever backend the declared spec already has. OpenTofu is an optional engine underneath that path — not a command you run yourself.
 
@@ -37,7 +49,7 @@ stack("demoaws").backend(Backend::Aws).add(db).add(cache).add(files).apply();
 
 1. Plans the declared stack against `.tofy/state.json` **and live containers** (running, image, published port/bind). A `docker stop` or a remapped publish is a change.
 2. Creates a private Docker network for the stack. Resources resolve each other by name (`appdb`, `cache`, `uploads`).
-3. Generates secrets once (passwords, object-store keys) and persists them in state. They are never re-derived as `tofy-{project}-{name}`.
+3. Generates secrets once (passwords, object-store keys, `secret()` values) and persists them in state. They are never re-derived as `tofy-{project}-{name}`. A `secret` resource is state + outputs only — no Docker or AWS resource.
 4. Starts resources. The local backend uses Docker directly. The Tofu backend emits a docker-provider config and runs the OpenTofu engine. The Aws backend emits an AWS-provider config and runs the same engine against RDS, ElastiCache Redis, and S3. Published ports on Docker backends default to `127.0.0.1`. Local / Tofu apply waits until Postgres, Redis, and the object store accept connections (Redis AUTH, named bucket created). A dead port is not Applied.
 5. Writes `.tofy/outputs.env` and `.tofy/outputs.json` (mode `0600`). Host consumers (`tofy run` on the laptop) get `127.0.0.1` URIs. Sibling containers on the stack network use `INTERNAL_*` keys (`postgres://…@appdb:5432/…`).
 6. `tofy run -- <cmd>` injects those env vars and execs. Apps do not depend on dotenv.
@@ -97,6 +109,8 @@ After apply, names are `TOFY_<RESOURCE>_<KEY>`:
 | `appdb` (postgres) | `TOFY_APPDB_URI`, `TOFY_APPDB_PASSWORD`, `TOFY_APPDB_USER`, `TOFY_APPDB_DATABASE`, `TOFY_APPDB_PORT`, `TOFY_APPDB_HOST`, plus `TOFY_APPDB_INTERNAL_*` |
 | `cache` (redis) | Local / Tofu: `TOFY_CACHE_URI` (`redis://:<password>@127.0.0.1:…`), `TOFY_CACHE_PASSWORD`, `TOFY_CACHE_PORT`, `TOFY_CACHE_HOST`, plus `TOFY_CACHE_INTERNAL_*`. Aws: `TOFY_CACHE_URI` is `rediss://:<password>@…` (TLS; ElastiCache AUTH) |
 | `uploads` (bucket) | Local / Tofu: `TOFY_UPLOADS_ENDPOINT`, `TOFY_UPLOADS_ACCESS_KEY`, `TOFY_UPLOADS_SECRET_KEY`, `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_PORT`, plus `TOFY_UPLOADS_INTERNAL_*`. Aws: `TOFY_UPLOADS_BUCKET`, `TOFY_UPLOADS_REGION`, `TOFY_UPLOADS_ENDPOINT` (no minted keys) |
+| `signing` (`secret`) | `TOFY_SIGNING_VALUE` (generated once, mode `0600`). `tofy output` redacts it. Not a container. |
+| export aliases | `.export("OAG_DATABASE__URL")` also writes that name, same value as the default key (`uri` for postgres/mysql/redis, `endpoint` for bucket, `value` for secret). `.export_key(env, key)` picks another output. Env names are `[A-Z0-9_]+`. |
 
 Rust apps that want a live pool can add `tofy-pg` and call `pool_from_env("TOFY_APPDB_URI")` (or `pool_from_outputs`). That is opt-in. Other languages keep reading env. `#[tofy::main]` stays sync.
 
@@ -106,7 +120,7 @@ Rust apps that want a live pool can add `tofy-pg` and call `pool_from_env("TOFY_
 
 ## Size and bind
 
-Attributes, not new resource types. Language stays `postgres`, `mysql`, `redis`, `bucket`.
+Attributes, not new resource types. Language stays `postgres`, `mysql`, `redis`, `bucket`, `secret`.
 
 | size | local Docker and OpenTofu docker provider | AWS (`Backend::Aws`) |
 | --- | --- | --- |

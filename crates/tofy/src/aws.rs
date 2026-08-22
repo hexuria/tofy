@@ -222,6 +222,7 @@ fn merge_engine_outputs(parsed: &Value, spec: &Project, state: &mut State) -> Re
                 rs.outputs.remove("access_key");
                 rs.outputs.remove("secret_key");
             }
+            Kind::Secret => {}
         }
     }
     Ok(())

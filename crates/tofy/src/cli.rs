@@ -310,11 +310,16 @@ fn forward_to_declaration(dir: &Path, cli: &Cli, cmd: &Cmd) -> Result<()> {
     Ok(())
 }
 
+/// Env map `tofy run` injects. Same keys as `.tofy/outputs.env` (TOFY_* plus exports).
+pub(crate) fn run_env(root: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    outputs::load(root)
+}
+
 pub(crate) fn run_command(root: &Path, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(Error::Usage("tofy run -- <command>".into()));
     }
-    let env = outputs::load(root)?;
+    let env = run_env(root)?;
     let mut cmd = Command::new(&args[0]);
     if args.len() > 1 {
         cmd.args(&args[1..]);
@@ -381,5 +386,35 @@ mod tests {
             msg.contains("spec JSON") || msg.contains("stack declaration"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn run_env_includes_export_aliases() {
+        use crate::outputs;
+        use crate::state::{prepare_state, State};
+        use tofy_spec::{Kind, Resource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = Project::new("oag");
+        spec.resources.push(
+            Resource::new("appdb", Kind::Postgres)
+                .with_port(5452)
+                .with_export("OAG_DATABASE__URL"),
+        );
+        spec.resources
+            .push(Resource::new("cache", Kind::Redis).with_export("OAG_REDIS__URL"));
+        spec.resources.push(
+            Resource::new("signing", Kind::Secret).with_export("OAG_SECURITY__SIGNING_SECRET"),
+        );
+        let state = prepare_state(&spec, &State::default());
+        outputs::write(dir.path(), &state).unwrap();
+        let env = run_env(dir.path()).unwrap();
+        assert_eq!(env["OAG_DATABASE__URL"], env["TOFY_APPDB_URI"]);
+        assert_eq!(env["OAG_REDIS__URL"], env["TOFY_CACHE_URI"]);
+        assert_eq!(
+            env["OAG_SECURITY__SIGNING_SECRET"],
+            env["TOFY_SIGNING_VALUE"]
+        );
+        assert!(!env["TOFY_SIGNING_VALUE"].is_empty());
     }
 }

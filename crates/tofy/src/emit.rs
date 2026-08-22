@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use tofy_spec::{docker_network, replica_alias, replica_container, replica_volume, Backend, Bind, Kind, Project};
+use tofy_spec::{
+    docker_network, replica_alias, replica_container, replica_volume, Backend, Bind, Kind, Project,
+};
 
 use crate::aws;
 use crate::error::Result;
@@ -20,10 +22,13 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
     let mut volumes = serde_json::Map::new();
     let net = docker_network(&spec.project);
 
-    for r in &spec.resources {
+    for r in spec.resources.iter().filter(|r| r.kind.is_runtime()) {
         let image = docker_image(r);
         let image_key = sanitize(&r.name);
-        images.insert(image_key.clone(), json!({ "name": image, "keep_locally": true }));
+        images.insert(
+            image_key.clone(),
+            json!({ "name": image, "keep_locally": true }),
+        );
         let rs = state.resources.get(&r.name);
         let outs = rs.map(|s| s.outputs.clone()).unwrap_or_default();
         let host_port = rs.map(|s| s.port).unwrap_or_else(|| r.port_or_default());
@@ -73,7 +78,7 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
                     Kind::Postgres => "/var/lib/postgresql/data",
                     Kind::Mysql => "/var/lib/mysql",
                     Kind::Bucket => "/data",
-                    Kind::Redis => unreachable!(),
+                    Kind::Redis | Kind::Secret => unreachable!(),
                 };
                 c["volumes"] = json!([{
                     "volume_name": format!("${{docker_volume.{key}.name}}"),
@@ -85,7 +90,7 @@ pub fn terraform_json(spec: &Project, state: &State) -> Value {
     }
 
     let mut resource = serde_json::Map::new();
-    if !spec.resources.is_empty() {
+    if spec.has_runtime() {
         resource.insert(
             "docker_network".into(),
             json!({
@@ -116,7 +121,7 @@ fn docker_host() -> String {
 pub fn compose_yaml(spec: &Project, state: &State) -> String {
     let net = docker_network(&spec.project);
     let mut s = String::from("services:\n");
-    for r in &spec.resources {
+    for r in spec.resources.iter().filter(|r| r.kind.is_runtime()) {
         let outs = state
             .resources
             .get(&r.name)
@@ -486,6 +491,7 @@ pub fn aws_terraform_json(spec: &Project, state: &State) -> Result<Value> {
                     json!({ "value": format!("https://${{aws_s3_bucket.{key}.bucket}}.s3.${{data.aws_region.current.name}}.amazonaws.com") }),
                 );
             }
+            Kind::Secret => {}
         }
     }
 
@@ -665,6 +671,7 @@ fn container_env(
                 ":9001".into(),
             ]),
         ),
+        Kind::Secret => (vec![], None),
     }
 }
 
@@ -672,7 +679,7 @@ fn container_env(
 mod tests {
     use super::*;
     use crate::state::prepare_state;
-    use tofy_spec::{Kind, Resource};
+    use tofy_spec::{Backend, Kind, Resource};
 
     #[test]
     fn compose_and_terraform_emit_one_container_per_resource() {
@@ -1114,17 +1121,42 @@ mod tests {
         assert_eq!(labels0[2]["value"], "1");
         assert_eq!(labels1[2]["value"], "2");
         assert_eq!(labels1[1]["value"], "cache");
-        assert!(
-            tf["resource"]["docker_image"]
-                .as_object()
-                .unwrap()
-                .contains_key("cache")
+        assert!(tf["resource"]["docker_image"]
+            .as_object()
+            .unwrap()
+            .contains_key("cache"));
+        assert!(!tf["resource"]["docker_image"]
+            .as_object()
+            .unwrap()
+            .contains_key("cache_2"));
+    }
+
+    #[test]
+    fn secret_is_not_a_docker_or_aws_resource() {
+        let mut spec = Project::new("oag");
+        spec.resources
+            .push(Resource::new("cache", Kind::Redis).with_export("OAG_REDIS__URL"));
+        spec.resources.push(
+            Resource::new("signing", Kind::Secret).with_export("OAG_SECURITY__SIGNING_SECRET"),
         );
-        assert!(
-            !tf["resource"]["docker_image"]
-                .as_object()
-                .unwrap()
-                .contains_key("cache_2")
-        );
+        let state = prepare_state(&spec, &State::default());
+        let tf = terraform_json(&spec, &state);
+        let containers = tf["resource"]["docker_container"].as_object().unwrap();
+        assert!(containers.contains_key("cache"));
+        assert!(!containers.contains_key("signing"), "{containers:?}");
+        let compose = compose_yaml(&spec, &state);
+        assert!(compose.contains("cache:"));
+        assert!(!compose.contains("signing:"));
+
+        spec.backend = Backend::Aws;
+        let mut aws_state = prepare_state(&spec, &State::default());
+        aws_state.applier_cidr = Some("203.0.113.10/32".into());
+        let atf = aws_terraform_json(&spec, &aws_state).unwrap();
+        assert!(atf["resource"]
+            .get("aws_elasticache_replication_group")
+            .is_some());
+        let dump = atf.to_string();
+        assert!(!dump.contains("signing"), "{dump}");
+        assert!(!dump.contains("aws_secretsmanager"), "{dump}");
     }
 }

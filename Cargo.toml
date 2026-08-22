@@ -9,6 +9,7 @@ members = [
     "examples/infra-tofu",
     "examples/infra-aws",
     "examples/infra-mysql",
+    "examples/infra-export",
 ]
 
 [workspace.package]
