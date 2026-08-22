@@ -88,6 +88,16 @@ No AWS, no new kinds, no PgPool.
 - Unit tests: tofy SG + `/32`, not `0.0.0.0/0` for Localhost; no `aws_vpc` resource; default-VPC data source stays; S3 unchanged; missing public-IP detection errors; Redis URI is `rediss://`.
 - `scripts/ci-smoke-aws.sh` still `tofu validate` only (stub the `/32`); assert ingress is a `/32`; missing-creds still must not claim Applied. Local and tofu-docker smokes stay required.
 
+## This PR — consume-path export aliases + `secret`
+
+Apps that already have their own env names (open-ai-gateway is the motivating example, not a special case in the API) need `tofy run` to inject those names. Today apply only writes `TOFY_<RESOURCE>_<KEY>`. This slice adds generic export aliases and a state-only secret kind.
+
+- `.export(env)` / `.export_key(env, key)` on `Postgres<Open>`, `Mysql<Open>`, `Redis<Open>`, `Bucket<Open>`, `Secret<Open>`. Default key is `uri` (engines), `endpoint` (bucket), `value` (secret). Aliases live in the JSON IR so `--spec` can set them. Env names are `[A-Z0-9_]+`.
+- `secret("signing")` generates a high-entropy value once, persists it in state `0600`, writes `TOFY_SIGNING_VALUE`, maps `.export(...)`. No Docker / AWS resource. Plan is create/noop. Destroy clears. Re-apply does not rotate.
+- `tofy output` redacts secret values. Plan does not print them.
+- `examples/infra-export` shows the oag-shaped names. No dependency on hexuria/open-ai-gateway. No Caddy, Envoy, Fargate, VPC macros, or oag types in the public API.
+- Existing CI smokes stay required and unchanged.
+
 ## Later
 
 - Importers into the same IR (not a write path; not auto-loaded) — **Compose subset shipped:** `tofy import compose` emits JSON IR. `--spec` remains JSON-only. Unknown images fail.

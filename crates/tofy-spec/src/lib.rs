@@ -41,6 +41,7 @@ pub enum Kind {
     Mysql,
     Redis,
     Bucket,
+    Secret,
 }
 
 impl fmt::Display for Kind {
@@ -50,6 +51,23 @@ impl fmt::Display for Kind {
             Kind::Mysql => write!(f, "mysql"),
             Kind::Redis => write!(f, "redis"),
             Kind::Bucket => write!(f, "bucket"),
+            Kind::Secret => write!(f, "secret"),
+        }
+    }
+}
+
+impl Kind {
+    /// Container / cloud resource. [`Kind::Secret`] is state + outputs only.
+    pub fn is_runtime(self) -> bool {
+        !matches!(self, Kind::Secret)
+    }
+
+    /// Default output key for `.export(env)` / an IR export that omits `key`.
+    pub fn default_export_key(self) -> &'static str {
+        match self {
+            Kind::Postgres | Kind::Mysql | Kind::Redis => "uri",
+            Kind::Bucket => "endpoint",
+            Kind::Secret => "value",
         }
     }
 }
@@ -171,6 +189,7 @@ impl Kind {
             Kind::Mysql => 3306,
             Kind::Redis => 6379,
             Kind::Bucket => 9000,
+            Kind::Secret => 0,
         }
     }
 
@@ -180,6 +199,7 @@ impl Kind {
             Kind::Mysql => "8",
             Kind::Redis => "7",
             Kind::Bucket => "latest",
+            Kind::Secret => "",
         }
     }
 
@@ -204,6 +224,43 @@ fn is_one(n: &u32) -> bool {
     *n == 1
 }
 
+fn is_empty_exports(exports: &[Export]) -> bool {
+    exports.is_empty()
+}
+
+/// Consumer env var that receives a resource output after apply.
+///
+/// `key` is the resource output (`uri`, `password`, `value`, …). When omitted,
+/// the engine uses [`Kind::default_export_key`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Export {
+    pub env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl Export {
+    pub fn new(env: impl Into<String>) -> Self {
+        Self {
+            env: env.into(),
+            key: None,
+        }
+    }
+
+    pub fn with_key(env: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            env: env.into(),
+            key: Some(key.into()),
+        }
+    }
+
+    pub fn output_key(&self, kind: Kind) -> &str {
+        self.key
+            .as_deref()
+            .unwrap_or_else(|| kind.default_export_key())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resource {
     pub name: String,
@@ -219,6 +276,9 @@ pub struct Resource {
     pub bind: Bind,
     #[serde(default = "default_replicas", skip_serializing_if = "is_one")]
     pub replicas: u32,
+    /// Extra env names written next to `TOFY_<RESOURCE>_<KEY>` after apply.
+    #[serde(default, skip_serializing_if = "is_empty_exports")]
+    pub exports: Vec<Export>,
 }
 
 impl Resource {
@@ -231,7 +291,18 @@ impl Resource {
             size: Size::Small,
             bind: Bind::Localhost,
             replicas: 1,
+            exports: Vec::new(),
         }
+    }
+
+    pub fn with_export(mut self, env: impl Into<String>) -> Self {
+        self.exports.push(Export::new(env));
+        self
+    }
+
+    pub fn with_export_key(mut self, env: impl Into<String>, key: impl Into<String>) -> Self {
+        self.exports.push(Export::with_key(env, key));
+        self
     }
 
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
@@ -339,6 +410,11 @@ impl Project {
                         "bucket has no HA: replicas must be 1".into(),
                     ));
                 }
+                if r.kind == Kind::Secret {
+                    return Err(SpecError::Validation(
+                        "secret has no HA: replicas must be 1".into(),
+                    ));
+                }
                 if self.backend == Backend::Aws {
                     return Err(SpecError::Validation(format!(
                         "aws backend has no HA: {} replicas must be 1",
@@ -347,7 +423,13 @@ impl Project {
                 }
             }
         }
+        validate_exports(&self.resources)?;
         Ok(())
+    }
+
+    /// True when any resource is a container / cloud engine resource.
+    pub fn has_runtime(&self) -> bool {
+        self.resources.iter().any(|r| r.kind.is_runtime())
     }
 
     /// Stack-private Docker network name: `tofy-{project}`.
@@ -394,11 +476,114 @@ pub fn is_secret_key(key: &str) -> bool {
         || k == "secret_key"
         || k == "access_key"
         || k == "uri"
+        || k == "value"
+        || k == "kek"
         || k.ends_with("_password")
         || k.ends_with("_secret")
         || k.ends_with("_secret_key")
         || k.ends_with("_access_key")
         || k.ends_with("_uri")
+        || k.ends_with("_value")
+        || k.ends_with("_url")
+        || k.ends_with("_kek")
+}
+
+/// Consumer env var: non-empty `A-Z0-9_` (no spaces, no lowercase).
+pub fn is_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn is_output_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn known_output_keys(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::Postgres | Kind::Mysql => &[
+            "uri",
+            "internal_uri",
+            "user",
+            "password",
+            "database",
+            "host",
+            "port",
+            "internal_host",
+            "internal_port",
+            "bind",
+            "size",
+            "replicas",
+        ],
+        Kind::Redis => &[
+            "uri",
+            "internal_uri",
+            "password",
+            "host",
+            "port",
+            "internal_host",
+            "internal_port",
+            "bind",
+            "size",
+            "replicas",
+        ],
+        Kind::Bucket => &[
+            "endpoint",
+            "internal_endpoint",
+            "access_key",
+            "secret_key",
+            "bucket",
+            "host",
+            "port",
+            "internal_host",
+            "internal_port",
+            "region",
+            "bind",
+            "size",
+            "replicas",
+        ],
+        Kind::Secret => &["value"],
+    }
+}
+
+fn validate_exports(resources: &[Resource]) -> Result<(), SpecError> {
+    let mut envs = BTreeSet::new();
+    for r in resources {
+        for export in &r.exports {
+            if !is_env_name(&export.env) {
+                return Err(SpecError::Validation(format!(
+                    "export env {:?} must be [A-Z0-9_]+",
+                    export.env
+                )));
+            }
+            let key = export.output_key(r.kind);
+            if !is_output_key(key) {
+                return Err(SpecError::Validation(format!(
+                    "export key {:?} on {} must be [A-Za-z][A-Za-z0-9_]*",
+                    key, r.name
+                )));
+            }
+            if !known_output_keys(r.kind).contains(&key) {
+                return Err(SpecError::Validation(format!(
+                    "export key {:?} is not an output of {}",
+                    key, r.kind
+                )));
+            }
+            if !envs.insert(export.env.clone()) {
+                return Err(SpecError::Validation(format!(
+                    "duplicate export env {}",
+                    export.env
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn container_name(project: &str, resource: &str) -> String {
@@ -518,14 +703,103 @@ mod tests {
         assert!(is_secret_key("secret_key"));
         assert!(is_secret_key("access_key"));
         assert!(is_secret_key("uri"));
+        assert!(is_secret_key("value"));
         assert!(is_secret_key("TOFY_APPDB_PASSWORD"));
         assert!(is_secret_key("TOFY_APPDB_URI"));
         assert!(is_secret_key("TOFY_UPLOADS_SECRET_KEY"));
+        assert!(is_secret_key("TOFY_SIGNING_VALUE"));
+        assert!(is_secret_key("OAG_DATABASE__URL"));
+        assert!(is_secret_key("OAG_SECURITY__SIGNING_SECRET"));
+        assert!(is_secret_key("OAG_SECURITY__CREDENTIAL_KEK"));
         assert!(!is_secret_key("port"));
         assert!(!is_secret_key("TOFY_APPDB_PORT"));
         assert!(!is_secret_key("TOFY_APPDB_USER"));
         assert!(!is_secret_key("TOFY_UPLOADS_ENDPOINT"));
         assert!(!is_secret_key("TOFY_UPLOADS_BUCKET"));
+    }
+
+    #[test]
+    fn export_aliases_roundtrip() {
+        let spec = Project::from_json_str(
+            r#"{
+                "project": "oag",
+                "resources": [
+                    {"name": "appdb", "type": "postgres", "exports": [{"env": "OAG_DATABASE__URL"}]},
+                    {"name": "cache", "type": "redis", "exports": [{"env": "OAG_REDIS__URL", "key": "uri"}]},
+                    {"name": "signing", "type": "secret", "exports": [{"env": "OAG_SECURITY__SIGNING_SECRET"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(spec.resources[0].exports[0].env, "OAG_DATABASE__URL");
+        assert_eq!(
+            spec.resources[0].exports[0].output_key(Kind::Postgres),
+            "uri"
+        );
+        assert_eq!(spec.resources[1].exports[0].output_key(Kind::Redis), "uri");
+        assert_eq!(spec.resources[2].kind, Kind::Secret);
+        assert_eq!(
+            spec.resources[2].exports[0].output_key(Kind::Secret),
+            "value"
+        );
+        let again = Project::from_json_str(&spec.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(spec, again);
+        assert!(!spec.has_runtime() || spec.resources.iter().any(|r| r.kind.is_runtime()));
+        assert!(spec.has_runtime());
+    }
+
+    #[test]
+    fn reject_invalid_export_env() {
+        let err = Project::from_json_str(
+            r#"{"project":"demo","resources":[{"name":"appdb","type":"postgres","exports":[{"env":"not a name"}]}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("export env"), "{err}");
+        let err = Project::from_json_str(
+            r#"{"project":"demo","resources":[{"name":"appdb","type":"postgres","exports":[{"env":"oag_database__url"}]}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("[A-Z0-9_]"), "{err}");
+    }
+
+    #[test]
+    fn reject_unknown_export_key_and_duplicate_env() {
+        let err = Project::from_json_str(
+            r#"{"project":"demo","resources":[{"name":"appdb","type":"postgres","exports":[{"env":"OAG_X","key":"nope"}]}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not an output"), "{err}");
+        let err = Project::from_json_str(
+            r#"{
+                "project": "demo",
+                "resources": [
+                    {"name": "appdb", "type": "postgres", "exports": [{"env": "OAG_X"}]},
+                    {"name": "cache", "type": "redis", "exports": [{"env": "OAG_X"}]}
+                ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate export"), "{err}");
+    }
+
+    #[test]
+    fn secret_rejects_replicas() {
+        let err = Project::from_json_str(
+            r#"{"project":"demo","resources":[{"name":"signing","type":"secret","replicas":2}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("secret has no HA"), "{err}");
+    }
+
+    #[test]
+    fn secret_only_stack_has_no_runtime() {
+        let spec = Project::from_json_str(
+            r#"{"project":"oag","resources":[{"name":"signing","type":"secret"}]}"#,
+        )
+        .unwrap();
+        assert!(!spec.has_runtime());
+        assert_eq!(Kind::Secret.default_export_key(), "value");
+        assert!(!Kind::Secret.is_runtime());
     }
 
     #[test]

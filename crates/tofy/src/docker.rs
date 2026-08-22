@@ -412,6 +412,11 @@ fn start_one(spec: &Project, r: &Resource, rs: &ResourceState, index: u32) -> Re
             cmd.arg(docker_image(r));
             cmd.args(["server", "/data", "--console-address", ":9001"]);
         }
+        Kind::Secret => {
+            return Err(Error::Engine(
+                "secret is state-only; it has no container".into(),
+            ));
+        }
     }
 
     run_checked(cmd)
@@ -476,6 +481,7 @@ pub fn ready_replica(r: &Resource, rs: &ResourceState, container: &str, index: u
                 .ok_or_else(|| Error::Engine("bucket secret_key missing from state".into()))?;
             crate::s3::ensure_bucket(rs.port, access, secret, &r.name)
         }
+        Kind::Secret => Ok(()),
     }
 }
 
